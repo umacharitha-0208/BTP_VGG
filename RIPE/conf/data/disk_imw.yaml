@@ -1,0 +1,17 @@
+defaults:
+  - _self_
+
+name: imw2022
+
+_target_: ripe.data.datasets.disk_imw.get_disk_imw
+
+root_dir: ${oc.env:DATA_DIR}          # ← will use C:/Users/linga/Downloads/imw2022
+
+image_size: 1024
+positive_ratio: 0.5
+
+batch_size: 4
+num_workers: 4
+pin_memory: true
+shuffle: true
+drop_last: true

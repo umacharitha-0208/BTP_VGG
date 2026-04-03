@@ -1,0 +1,18 @@
+# conf/data/imw2022.yaml
+defaults:
+  - _self_
+
+name: imw2022
+
+_target_: ripe.data.datasets.imw2022.get_imw2022
+
+root_dir: C:\Users\linga\Downloads\imw2022
+
+image_size: 256
+positive_ratio: 0.5
+
+batch_size: 4               # ← adjust to your GPU memory
+num_workers: 0
+pin_memory: true
+shuffle: true
+drop_last: true

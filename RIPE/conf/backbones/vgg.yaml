@@ -1,0 +1,7 @@
+_target_: ripe.models.backbones.vgg.VGG
+nchannels: 3
+pretrained: True
+use_instance_norm: False
+mode: dect
+use_gradient_checkpointing: False # Disable for CPU test to save cycles
+freeze_layers: 10  # Freeze first 10 layers to save gradient memory

@@ -1,0 +1,25 @@
+[Step 1/250] Started
+[Step 1/250] Skipped (no matches found)
+[Step 2/250] Started
+[Step 2/250] Skipped (no matches found)
+[Step 3/250] Started
+[Step 3/250] Skipped (no matches found)
+[Step 4/250] Started
+[Step 4/250] Skipped (no matches found)
+[Step 5/250] Started
+[Step 5/250] Loss: 0.8677, Reward: 3.0, Det: (94, 92)
+[Step 6/250] Started
+[Step 6/250] Skipped (no matches found)
+[Step 7/250] Started
+[Step 7/250] Loss: 0.6232, Reward: 2.5, Det: (92, 100)
+[Step 8/250] Started
+[Step 8/250] Skipped (no matches found)
+[Step 9/250] Started
+[Step 9/250] Skipped (no matches found)
+[Step 10/250] Started
+[Step 10/250] Skipped (no matches found)
+[Step 11/250] Started
+[Step 11/250] Loss: 0.7311, Reward: 5.5, Det: (101, 96)
+[Step 12/250] Started
+[Step 12/250] Skipped (no matches found)
+[Step 13/250] Started

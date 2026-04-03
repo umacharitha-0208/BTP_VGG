@@ -1,0 +1,5 @@
+[2026-04-03 16:02:53,031][ripe.models.backbones.vgg_utils][INFO] - Freezing first 10 layers of VGG19 for memory optimization
+[2026-04-03 16:02:53,037][ripe.models.ripe][INFO] - Training with window size 8.
+[2026-04-03 16:02:53,044][__main__][INFO] - Number of trainable parameters: 14701383
+[2026-04-03 16:02:53,105][ripe.scheduler.linear_with_plateaus][INFO] - LinearWithPlateaus: start_val=0.0, end_val=1.0, steps_total=250, plateau_start_steps=0.0, plateau_end_steps=166.66665
+[2026-04-03 16:02:53,110][ripe.scheduler.linear_with_plateaus][INFO] - LinearWithPlateaus: start_val=0.0, end_val=1.0, steps_total=250, plateau_start_steps=0.0, plateau_end_steps=0.0

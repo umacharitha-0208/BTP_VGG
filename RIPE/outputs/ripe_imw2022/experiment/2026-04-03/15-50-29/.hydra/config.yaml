@@ -1,0 +1,91 @@
+data:
+  name: imw2022
+  _target_: ripe.data.datasets.imw2022.get_imw2022
+  root_dir: C:\Users\linga\Downloads\imw2022
+  image_size: 256
+  positive_ratio: 0.5
+  batch_size: 4
+  num_workers: 0
+  pin_memory: true
+  shuffle: true
+  drop_last: true
+backbones:
+  _target_: ripe.models.backbones.vgg.VGG
+  nchannels: 3
+  pretrained: true
+  use_instance_norm: false
+  mode: dect
+  use_gradient_checkpointing: false
+  freeze_layers: 10
+upsampler:
+  _target_: ripe.models.upsampler.hypercolumn_features.HyperColumnFeatures
+  mode: bilinear
+matcher:
+  _target_: ripe.matcher.concurrent_matcher.ConcurrentMatcher
+  min_num_matches: 8
+  matcher:
+    _target_: kornia.feature.DescriptorMatcher
+    match_mode: mnn
+    th: 0.8
+  robust_estimator:
+    _target_: ripe.matcher.pose_estimator_poselib.PoseLibRelativePoseEstimator
+descriptor_loss:
+  _target_: ripe.losses.contrastive_loss.ContrastiveLoss
+  pos_margin: 0.2
+  neg_margin: 0.2
+inl_th:
+  _target_: ripe.scheduler.constant.ConstantScheduler
+  value: 1.0
+project_name: ripe_imw2022
+name: experiment
+output_dir: ./outputs/${project_name}/${name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+num_gpus: 1
+precision: 32-true
+log_interval: 50
+wandb_mode: disabled
+val_interval: 2000
+conf_inference:
+  threshold: 0.5
+  top_k: 2048
+desc_loss_weight: 5.0
+num_workers: 4
+batch_size: 4
+transformation_model: fundamental
+network:
+  _target_: ripe.models.ripe.RIPE
+  _partial_: true
+  window_size: 8
+  non_linearity_dect:
+    _target_: torch.nn.Identity
+  desc_shares: null
+lr: 0.001
+fp_penalty: -1.0e-07
+kp_penalty: -7.0e-07
+num_grad_accs: 2
+reward_type: inlier
+no_filtering_negatives: false
+descriptor_dim: 256
+lr_scheduler:
+  _partial_: true
+  _target_: ripe.scheduler.linearLR.StepLinearLR
+  num_steps: ${num_steps}
+  initial_lr: ${lr}
+  final_lr: 1.0e-06
+use_whitening: false
+selected_only: false
+padding_filter_mode: ignore
+num_steps: 250
+alpha_scheduler:
+  _target_: ripe.scheduler.linear_with_plateaus.LinearWithPlateaus
+  start_val: 0.0
+  end_val: 1.0
+  steps_total: ${num_steps}
+  rel_length_start_plateau: 0.0
+  rel_length_end_plateu: 0.6666666
+beta_scheduler:
+  _target_: ripe.scheduler.linear_with_plateaus.LinearWithPlateaus
+  start_val: 0.0
+  end_val: 1.0
+  steps_total: ${num_steps}
+  rel_length_start_plateau: 0.0
+  rel_length_end_plateu: 0.0

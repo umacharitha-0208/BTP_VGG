@@ -1,0 +1,19 @@
+{
+  "total_pairs": 126,
+  "successful_matches": 126,
+  "success_rate": 1.0,
+  "avg_keypoints_1": 937.7619047619048,
+  "avg_keypoints_2": 921.5555555555555,
+  "avg_matches": 187.26190476190476,
+  "avg_inliers": 30.61111111111111,
+  "avg_inlier_ratio": 0.2105750542473827,
+  "avg_time_extraction": 4.681204865849208,
+  "avg_time_matching": 0.09890728905087426,
+  "avg_time_total": 4.780112154900082,
+  "positive_pairs": 98,
+  "negative_pairs": 28,
+  "positive_success_rate": 1.0,
+  "positive_avg_inliers": 34.12244897959184,
+  "negative_success_rate": 1.0,
+  "negative_avg_inliers": 18.321428571428573
+}
