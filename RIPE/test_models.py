@@ -338,6 +338,22 @@ class ModelEvaluator:
         if negative_results:
             summary["negative_success_rate"] = sum(1 for r in negative_results if r["success"]) / len(negative_results)
             summary["negative_avg_inliers"] = np.mean([r["num_inliers"] for r in negative_results])
+
+        # Discrimination metrics
+        # TPR = True Positive Rate  = positive_success_rate  (correct match found for same-scene)
+        # FPR = False Positive Rate = negative_success_rate  (spurious match found for diff-scene)
+        # A good model has high TPR and low FPR.
+        if positive_results and negative_results:
+            tpr = summary.get("positive_success_rate", 0.0)
+            fpr = summary.get("negative_success_rate", 0.0)
+            tnr = 1.0 - fpr
+            summary["tpr"] = tpr           # recall for positive pairs
+            summary["fpr"] = fpr           # false alarm rate for negative pairs
+            summary["tnr"] = tnr           # specificity
+            # Balanced accuracy treats positive and negative classes equally
+            summary["balanced_accuracy"] = (tpr + tnr) / 2.0
+            # Youden's J statistic: 0 = no discrimination, 1 = perfect
+            summary["youden_j"] = tpr - fpr
         
         return summary
     
@@ -363,14 +379,22 @@ class ModelEvaluator:
         if "positive_success_rate" in summary:
             print(f"\n✅ Positive Pairs (same scene):")
             print(f"  Count: {summary['positive_pairs']}")
-            print(f"  Success rate: {summary['positive_success_rate']*100:.1f}%")
+            print(f"  Success rate (TPR): {summary['positive_success_rate']*100:.1f}%")
             print(f"  Avg inliers: {summary['positive_avg_inliers']:.1f}")
         
         if "negative_success_rate" in summary:
             print(f"\n❌ Negative Pairs (different scenes):")
             print(f"  Count: {summary['negative_pairs']}")
-            print(f"  Success rate: {summary['negative_success_rate']*100:.1f}%")
+            print(f"  False positive rate (FPR): {summary['negative_success_rate']*100:.1f}%")
             print(f"  Avg inliers: {summary['negative_avg_inliers']:.1f}")
+
+        if "balanced_accuracy" in summary:
+            print(f"\n🎯 Discrimination Metrics:")
+            print(f"  TPR (recall):          {summary['tpr']*100:.1f}%")
+            print(f"  FPR (false alarm):     {summary['fpr']*100:.1f}%")
+            print(f"  TNR (specificity):     {summary['tnr']*100:.1f}%")
+            print(f"  Balanced accuracy:     {summary['balanced_accuracy']*100:.1f}%")
+            print(f"  Youden's J:            {summary['youden_j']:.3f}  (ideal = 1.0)")
         
         print(f"{'='*60}\n")
 
@@ -382,16 +406,20 @@ def compare_models(summary_original, summary_modified):
     print(f"{'='*60}\n")
     
     metrics = [
-        ("Success Rate", "success_rate", "%", 100),
-        ("Avg Inliers", "avg_inliers", "", 1),
-        ("Avg Inlier Ratio", "avg_inlier_ratio", "%", 100),
-        ("Avg Total Time", "avg_time_total", "s", 1),
+        ("Success Rate",      "success_rate",      "%", 100),
+        ("Avg Inliers",       "avg_inliers",       "",   1),
+        ("Avg Inlier Ratio",  "avg_inlier_ratio",  "%", 100),
+        ("Balanced Accuracy", "balanced_accuracy", "%", 100),
+        ("Youden's J",        "youden_j",          "",   1),
+        ("Avg Total Time",    "avg_time_total",    "s",  1),
     ]
     
     print(f"{'Metric':<25} {'Original':>12} {'Modified':>12} {'Change':>12}")
     print(f"{'-'*65}")
     
     for metric_name, metric_key, unit, scale in metrics:
+        if metric_key not in summary_original or metric_key not in summary_modified:
+            continue
         orig_val = summary_original.get(metric_key, 0) * scale
         mod_val = summary_modified.get(metric_key, 0) * scale
         
@@ -408,11 +436,11 @@ def compare_models(summary_original, summary_modified):
     
     print(f"\n{'='*60}")
     
-    # Determine winner
+    # Determine winner using balanced accuracy and Youden's J (better discrimination metrics)
     improvements = 0
-    if summary_modified["success_rate"] > summary_original["success_rate"]:
+    if summary_modified.get("balanced_accuracy", 0) > summary_original.get("balanced_accuracy", 0):
         improvements += 1
-    if summary_modified["avg_inliers"] > summary_original["avg_inliers"]:
+    if summary_modified.get("youden_j", 0) > summary_original.get("youden_j", 0):
         improvements += 1
     if summary_modified["avg_time_total"] < summary_original["avg_time_total"]:
         improvements += 1

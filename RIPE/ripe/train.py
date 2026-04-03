@@ -197,7 +197,7 @@ def train(cfg):
             loss_policy_stack = None
             loss_desc_stack = None
             loss_kp_stack = None
-            current_value_loss = None
+            value_loss_stack = []
 
             try:
                 batch = next(i_dl)
@@ -208,10 +208,10 @@ def train(cfg):
             p1, p2, mask_padding_1, mask_padding_2, Hs, label = unpack_batch(batch)
 
             # forward pass - extract keypoints & descriptors (PPO: also returns value estimates)
-            (kpts1, logprobs1, selected_mask1, mask_padding_grid_1, logits_selected_1, values1, out1) = net(
+            (kpts1, logprobs1, selected_mask1, mask_padding_grid_1, logits_selected_1, values1, entropy1, out1) = net(
                 p1, mask_padding_1, training=True
             )
-            (kpts2, logprobs2, selected_mask2, mask_padding_grid_2, logits_selected_2, values2, out2) = net(
+            (kpts2, logprobs2, selected_mask2, mask_padding_grid_2, logits_selected_2, values2, entropy2, out2) = net(
                 p2, mask_padding_2, training=True
             )
 
@@ -345,7 +345,7 @@ def train(cfg):
                 current_loss_policy = (advantages * dense_logprobs).view(-1)
                 
                 # PPO value loss: train critic to predict returns
-                current_value_loss = F.mse_loss(dense_values, dense_rewards.detach())
+                value_loss_stack.append(F.mse_loss(dense_values, dense_rewards.detach()))
                 loss_policy_stack = (
                     current_loss_policy
                     if loss_policy_stack is None
@@ -378,9 +378,13 @@ def train(cfg):
 
             loss = -loss
 
-            # PPO value loss (train critic)
-            if current_value_loss is not None:
-                loss += 0.5 * current_value_loss
+            # PPO value loss (train critic - averaged over valid batch items)
+            if value_loss_stack:
+                loss += 0.5 * torch.stack(value_loss_stack).mean()
+
+            # Entropy bonus: penalise premature policy collapse (coefficient 0.01)
+            entropy_bonus = 0.01 * (entropy1.mean() + entropy2.mean())
+            loss -= entropy_bonus
 
             if descriptor_loss is not None and loss_desc_stack is not None:
                 loss += cfg.desc_loss_weight * loss_desc_stack.mean()
@@ -412,6 +416,8 @@ def train(cfg):
                         "loss_policy": -loss_policy_stack.mean().item(),
                         "loss_kp": loss_kp_stack.mean().item() if loss_kp_stack is not None else 0.0,
                         "loss_hard": (loss_desc_stack.mean().item() if loss_desc_stack is not None else 0.0),
+                        "loss_value": torch.stack(value_loss_stack).mean().item() if value_loss_stack else 0.0,
+                        "entropy_bonus": entropy_bonus.item(),
                         "mean_num_det_kpts1": sum_num_keypoints_1 / batch_size,
                         "mean_num_det_kpts2": sum_num_keypoints_2 / batch_size,
                         "mean_reward": sum_reward_batch / batch_size,

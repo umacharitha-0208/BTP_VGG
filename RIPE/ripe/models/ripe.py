@@ -56,6 +56,11 @@ class PPOPolicy(nn.Module):
         value = self.critic(x)        # state value for advantage
         return prob, value
 
+    def entropy(self, x):
+        """Bernoulli entropy for the actor, used as an exploration bonus."""
+        prob = self.actor(x).clamp(1e-6, 1 - 1e-6)
+        return -(prob * prob.log() + (1 - prob) * (1 - prob).log())
+
 
 ###############################################################
 # KEYPOINT SAMPLER
@@ -85,6 +90,9 @@ class KeypointSampler(nn.Module):
         probs = probs.squeeze(-1)
         values = values.squeeze(-1)
 
+        # Entropy bonus: encourage exploration, prevent premature policy collapse
+        entropy = self.policy.entropy(policy_input).squeeze(-1)
+
         flipper = torch.distributions.Bernoulli(probs)
         accepted_choices = flipper.sample()
 
@@ -98,6 +106,7 @@ class KeypointSampler(nn.Module):
             accept_mask.squeeze(1),
             logits_selected.squeeze(1),
             values.squeeze(1),   # for GAE
+            entropy.squeeze(1),  # for entropy bonus
         )
 
     def precompute_idx_cells(self, H, W, device):
@@ -126,7 +135,7 @@ class KeypointSampler(nn.Module):
         if self.idx_cells is None or self.idx_cells.shape[2:4] != (H // self.window_size, W // self.window_size):
             self.idx_cells = self.precompute_idx_cells(H, W, x.device)
 
-        log_probs, idx, mask, logits_selected, values = self.sample(keypoint_cells)
+        log_probs, idx, mask, logits_selected, values, entropy = self.sample(keypoint_cells)
 
         keypoints = (
             torch.gather(
@@ -138,7 +147,7 @@ class KeypointSampler(nn.Module):
             .permute(0, 2, 3, 1)
         )
 
-        return keypoints.flip(-1), log_probs, mask, mask_padding, logits_selected, values
+        return keypoints.flip(-1), log_probs, mask, mask_padding, logits_selected, values, entropy
 
 
 ###############################################################
@@ -299,7 +308,7 @@ class RIPE(nn.Module):
         out["heatmap"] = self.non_linearity_dect(out["heatmap"])
 
         if training:
-            kpts, log_probs, mask, mask_padding, logits_selected, values = self.detector(
+            kpts, log_probs, mask, mask_padding, logits_selected, values, entropy = self.detector(
                 out["heatmap"], mask_padding
             )
 
@@ -319,6 +328,7 @@ class RIPE(nn.Module):
                 mask_padding.view(B, -1) if mask_padding is not None else None,
                 logits_selected.view(B, -1),
                 values.view(B, -1),
+                entropy.view(B, -1),
                 out,
             )
         else:
