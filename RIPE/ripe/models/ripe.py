@@ -57,7 +57,11 @@ class PPOPolicy(nn.Module):
         return prob, value
 
     def entropy(self, x):
-        """Bernoulli entropy for the actor, used as an exploration bonus."""
+        """Bernoulli entropy H(p) = -p·log(p) - (1-p)·log(1-p) for the actor.
+
+        Used as an exploration bonus to discourage premature policy collapse.
+        Returns non-negative values (max ≈ 0.693 at p=0.5).
+        """
         prob = self.actor(x).clamp(1e-6, 1 - 1e-6)
         return -(prob * prob.log() + (1 - prob) * (1 - prob).log())
 

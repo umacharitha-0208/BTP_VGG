@@ -436,7 +436,7 @@ def compare_models(summary_original, summary_modified):
     
     print(f"\n{'='*60}")
     
-    # Determine winner using balanced accuracy and Youden's J (better discrimination metrics)
+    # Determine winner using balanced accuracy, Youden's J, and speed
     improvements = 0
     if summary_modified.get("balanced_accuracy", 0) > summary_original.get("balanced_accuracy", 0):
         improvements += 1
