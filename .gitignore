@@ -1,0 +1,25 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+*.env
+
+# Notebook and tooling caches
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+
+# Training and experiment outputs
+outputs/
+RIPE/outputs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
