@@ -24,17 +24,34 @@ num_gpus: 1
 precision: "32-true" # Faster for CPU training fallback
 # precision: "16-mixed"
 
-log_interval: 50 # log every N steps/ batches
+log_interval: 100 # log every N steps/ batches
 wandb_mode: disabled
-val_interval: 2000
+val_interval: 5000
 conf_inference:
   threshold: 0.5
   top_k: 2048
 
-desc_loss_weight: 5.0 # 0.0 to deactivate, also deactivates 1x1 conv
+desc_loss_weight: 0.3  # was 1.0; high weight amplified margin-jump spikes
+reward_scale: 0.5      # was 0.3; stronger RL signal
+reward_scale_warmup_steps: 1000  # was 2000
+reward_norm_momentum: 0.995
+reward_norm_eps: 1e-6
+entropy_coef: 0.001    # was 0.0005; more exploration to escape plateau
+entropy_coef_warmup_steps: 1000  # was 2000
+value_loss_coef: 0.5
+value_loss_coef_warmup_steps: 1000  # was 2000
+ppo_epochs: 1
+ppo_clip_eps: 0.2      # was 0.15; slightly wider clip for early learning
+gamma: 0.99
+gae_lambda: 0.95
+rollout_steps: 1
+lr_warmup_steps: 500   # was 2000; shorter warmup relative to 5000 total steps
+kp_penalty_warmup_steps: 500   # was 2000
+fp_penalty_warmup_steps: 500   # was 2000
+gradient_clip_norm: 1.0  # was 0.5; allow more gradient flow during desc warmup
 
-num_workers: 4
-batch_size: 4
+num_workers: 0
+batch_size: 2   # was 4; halves memory and per-step compute
 
 transformation_model: fundamental
 
@@ -52,11 +69,11 @@ network:
     # - 64
     # - 64
 
-lr: 0.001 # 0.001 makes it somewhat unstable
-fp_penalty: -1e-7 # -1e-7
-kp_penalty: -7e-7 # -7e-7
-num_grad_accs: 2
-reward_type: inlier # inlier_ratio , inlier+inlier_ratio
+lr: 0.00003  # was 0.00005; lower for better stability with larger gradient_clip_norm
+fp_penalty: -1e-8
+kp_penalty: -1e-7
+num_grad_accs: 8
+reward_type: balanced # balanced | inlier_ratio | inlier+inlier_ratio
 no_filtering_negatives: False
 descriptor_dim: 256
 
@@ -69,25 +86,42 @@ lr_scheduler:
 
 use_whitening: false
 
-selected_only: False
+selected_only: false
 
 padding_filter_mode: ignore
 # padding_filter_mode: punish
 
-num_steps: 250
+num_steps: 250   # SMOKE TEST — change to 5000 for full training run
+
+# ====== Mitigation Parameters ======
+
+# Keypoint count floor regularizer
+kp_count_floor: 450          # was 380; raise floor to force more keypoints
+kp_count_penalty: 1.0        # was 0.5; stronger anti-suppression signal
+kp_count_warmup_steps: 200   # was 500; start penalizing suppression sooner
+
+# Descriptor warmup phase: train descriptor head alone before PPO kicks in.
+descriptor_warmup_steps: 50   # SMOKE TEST: 20% warmup (50/250); change to 500 for full run
+
+# Smooth descriptor margin annealing (pos_margin 2.0 → 1.0 over this many steps)
+# replaces the sudden jump at step 500 that caused loss spikes
+desc_margin_anneal_steps: 1000
+
+# Periodic checkpoint saving
+checkpoint_interval: 250     # SMOKE TEST: save at end; change to 1000 for full run
 
 alpha_scheduler: # 1.0 after 1/3 of the steps
   _target_: ripe.scheduler.linear_with_plateaus.LinearWithPlateaus
   start_val: 0.0
   end_val: 1.0
   steps_total: ${num_steps}
-  rel_length_start_plateau: 0.0
-  rel_length_end_plateu: 0.6666666
+  rel_length_start_plateau: 0.2
+  rel_length_end_plateu: 0.2
 
 beta_scheduler: # linear increase over all steps
   _target_: ripe.scheduler.linear_with_plateaus.LinearWithPlateaus
   start_val: 0.0
-  end_val: 1.0
+  end_val: 0.5
   steps_total: ${num_steps}
-  rel_length_start_plateau: 0.0
-  rel_length_end_plateu: 0.0
+  rel_length_start_plateau: 0.1
+  rel_length_end_plateu: 0.1

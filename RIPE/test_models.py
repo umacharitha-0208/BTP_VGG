@@ -108,12 +108,12 @@ class ModelEvaluator:
         """
         if use_modified:
             print("  Using MODIFIED matcher (CPU-optimized: PROSAC + Spatial Filter)")
-            matcher = KF.DescriptorMatcher("mnn")
+            matcher = KF.DescriptorMatcher("mnn", th=0.7)
             # Return a simple matcher for CPU - we'll add PROSAC logic in evaluate_pair
             return matcher, "modified"
         else:
             print("  Using ORIGINAL matcher (Basic MNN + RANSAC)")
-            matcher = KF.DescriptorMatcher("mnn")
+            matcher = KF.DescriptorMatcher("mnn", th=0.7)
             return matcher, "original"
     
     def load_test_pairs(self, test_dir):
@@ -200,7 +200,7 @@ class ModelEvaluator:
             # Keypoint extraction
             t_start = time.time()
             with torch.no_grad():
-                kpts_1, desc_1, score_1 = model.detectAndCompute(img1, threshold=0.5, top_k=2048)
+                kpts_1, desc_1, score_1 = model.detectAndCompute(img1, threshold=0.5, top_k=2048)  # Using trained threshold params
                 kpts_2, desc_2, score_2 = model.detectAndCompute(img2, threshold=0.5, top_k=2048)
             metrics["time_extraction"] = time.time() - t_start
             metrics["num_keypoints_1"] = kpts_1.shape[0]
@@ -218,8 +218,22 @@ class ModelEvaluator:
                 if desc_2.dim() == 3:
                     desc_2 = desc_2.squeeze(0)
                 
-                # MNN matching (same for both - same pretrained weights)
+                # MNN matching with ratio test for better quality
                 match_dists, match_idxs = matcher(desc_1, desc_2)
+                
+                # Apply ratio test to filter ambiguous matches
+                if match_idxs.shape[0] > 0:
+                    dists_full = torch.cdist(desc_1, desc_2, p=2)
+                    if dists_full.shape[1] > 1:
+                        top2_dists, _ = torch.topk(dists_full, k=2, dim=1, largest=False)
+                        matched_first_dists = top2_dists[match_idxs[:, 0], 0]
+                        matched_second_dists = top2_dists[match_idxs[:, 0], 1]
+                        
+                        # Standard Lowe's ratio test — keep only unambiguous matches.
+                        # Must match training (concurrent_matcher.py) to avoid train/test mismatch.
+                        ratio_mask = (matched_first_dists / (matched_second_dists + 1e-8)) < 0.80
+                        match_idxs = match_idxs[ratio_mask]
+                
                 matched_pts_1 = kpts_1[match_idxs[:, 0]]
                 matched_pts_2 = kpts_2[match_idxs[:, 1]]
                 
@@ -229,13 +243,17 @@ class ModelEvaluator:
                     # MODIFIED: Use poselib's LO-RANSAC (MAGSAC++ internally)
                     # Superior to kornia's basic RANSAC - finds more inliers
                     if match_idxs.shape[0] >= 8:
+                        # Adaptive threshold matching training code (pose_estimator_poselib)
+                        scale = torch.median(torch.cdist(matched_pts_1, matched_pts_1, p=2)) + 1e-6
+                        adaptive_th = float(max(0.5, min(1.5, scale * 1.0)))  # tighter cap vs 2.0
+                        
                         F_mat, info = poselib.estimate_fundamental(
                             matched_pts_1.cpu().numpy(),
                             matched_pts_2.cpu().numpy(),
                             {
-                                "max_epipolar_error": 1.0,
-                                "max_iterations": 10000,
-                                "confidence": 0.99999,
+                                "max_epipolar_error": adaptive_th,
+                                "max_iterations": 1000,
+                                "min_iterations": 100,
                             },
                         )
                         if F_mat is not None:
@@ -256,8 +274,14 @@ class ModelEvaluator:
             
             if metrics["num_matches"] > 0:
                 metrics["inlier_ratio"] = metrics["num_inliers"] / metrics["num_matches"]
-            
-            metrics["success"] = metrics["num_inliers"] >= 8
+
+            # Require both enough inliers AND a decent inlier ratio to declare success.
+            # The old threshold (8 inliers only) produced 100% false-positive rate on negative
+            # pairs because 12.6 inliers on unrelated scenes still crossed the bar.
+            metrics["success"] = (
+                metrics["num_inliers"] >= 15 and
+                metrics["inlier_ratio"] >= 0.25
+            )
             
         except Exception as e:
             print(f"    Error evaluating pair: {e}")

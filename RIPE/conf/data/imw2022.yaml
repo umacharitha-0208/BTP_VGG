@@ -8,11 +8,11 @@ _target_: ripe.data.datasets.imw2022.get_imw2022
 
 root_dir: C:\Users\linga\Downloads\imw2022
 
-image_size: 256
+image_size: 192   # was 256; (192/256)²=0.56 → 44% fewer pixels through all VGG layers
 positive_ratio: 0.5
 
 batch_size: 4               # ← adjust to your GPU memory
 num_workers: 0
-pin_memory: true
+pin_memory: false
 shuffle: true
 drop_last: true

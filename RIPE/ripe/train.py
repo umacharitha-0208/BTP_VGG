@@ -20,6 +20,8 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import collections
+import gc
+import math
 import os
 
 import hydra
@@ -104,10 +106,12 @@ def train(cfg):
 
     num_grad_accs = cfg.num_grad_accs  # gradient accumulation steps
 
-    # instantiate your custom dataset (from cfg.data = imw2022)
+    # instantiate your custom dataset (gitrom cfg.data = imw2022)
     ds = instantiate(cfg.data)
+    log.info(f"Dataset initialized with {len(ds)} samples")
 
     # prepare dataloader
+    log.info(f"Creating DataLoader with num_workers={cfg.num_workers}, batch_size={batch_size}")
     dl = DataLoader(
         ds,
         batch_size=batch_size,
@@ -116,8 +120,10 @@ def train(cfg):
         persistent_workers=False,
         num_workers=cfg.num_workers,
     )
-    dl = fabric.setup_dataloaders(dl)
+    log.info("DataLoader created, skipping fabric.setup_dataloaders for Windows compatibility")
+    # dl = fabric.setup_dataloaders(dl)  # Skip on Windows to avoid hanging
     i_dl = iter(dl)
+    log.info("DataLoader iterator created")
 
     # create matcher
     matcher = instantiate(cfg.matcher)
@@ -148,7 +154,7 @@ def train(cfg):
     fp_penalty = cfg.fp_penalty
     kp_penalty = cfg.kp_penalty
 
-    opt_pi = AdamW(filter(lambda x: x.requires_grad, net.parameters()), lr=lr, weight_decay=1e-5)
+    opt_pi = AdamW(filter(lambda x: x.requires_grad, net.parameters()), lr=lr, weight_decay=1e-6)
     net, opt_pi = fabric.setup(net, opt_pi)
 
     if cfg.lr_scheduler:
@@ -166,8 +172,15 @@ def train(cfg):
     beta_scheduler = instantiate(cfg.beta_scheduler)
     inl_th_scheduler = instantiate(cfg.inl_th)
 
+    # running reward normalization for PPO stability (Windowed RMS)
+    reward_norm_mean_hist = collections.deque(maxlen=500)
+    reward_norm_var_hist = collections.deque(maxlen=500)
+
+    # PPO rollout buffer
+    rollout_buffer = []
+
     # Open result file for logging
-    result_file = Path(__file__).resolve().parent.parent / "results2.txt"
+    result_file = Path(__file__).resolve().parent.parent / "results_80k.txt"
     result_fh = open(result_file, "w", buffering=1)  # Line buffered
 
     def write_result(msg):
@@ -181,7 +194,7 @@ def train(cfg):
 
     with tqdm.tqdm(total=steps) as pbar:
         for i_step in range(steps):
-            write_result(f"[Step {i_step+1}/{steps}] Started")
+            # write_result(f"[Step {i_step+1}/{steps}] Started")
 
             alpha = alpha_scheduler(i_step)
             beta = beta_scheduler(i_step)
@@ -190,14 +203,24 @@ def train(cfg):
             if scheduler:
                 scheduler.step()
 
+            if cfg.lr_warmup_steps > 0:
+                lr_factor = min(1.0, (i_step + 1) / cfg.lr_warmup_steps)
+                for param_group in opt_pi.param_groups:
+                    param_group["lr"] = cfg.lr * lr_factor
+
             sum_reward_batch = 0
+            sum_raw_reward_batch = 0
             sum_num_keypoints_1 = 0
             sum_num_keypoints_2 = 0
             loss = None
             loss_policy_stack = None
             loss_desc_stack = None
             loss_kp_stack = None
+            loss_value_stack = None
+            loss_return_stack = None
+            loss_advantage_stack = None
             current_value_loss = None
+            sum_inliers = 0
 
             try:
                 batch = next(i_dl)
@@ -208,10 +231,10 @@ def train(cfg):
             p1, p2, mask_padding_1, mask_padding_2, Hs, label = unpack_batch(batch)
 
             # forward pass - extract keypoints & descriptors (PPO: also returns value estimates)
-            (kpts1, logprobs1, selected_mask1, mask_padding_grid_1, logits_selected_1, values1, out1) = net(
+            (kpts1, logprobs1, selected_mask1, mask_padding_grid_1, logits_selected_1, values1, entropy1, choices1, accepted_choices1, out1) = net(
                 p1, mask_padding_1, training=True
             )
-            (kpts2, logprobs2, selected_mask2, mask_padding_grid_2, logits_selected_2, values2, out2) = net(
+            (kpts2, logprobs2, selected_mask2, mask_padding_grid_2, logits_selected_2, values2, entropy2, choices2, accepted_choices2, out2) = net(
                 p2, mask_padding_2, training=True
             )
 
@@ -245,10 +268,14 @@ def train(cfg):
                 label if cfg.no_filtering_negatives else None,
             )
 
+            sample_mask_selection_for_matching_1 = []
+            sample_mask_selection_for_matching_2 = []
+            sample_mask_padding_grid_1 = []
+            sample_mask_padding_grid_2 = []
+
             for b in range(batch_size):
-                if batch_rel_idx_matches[b] is None:
+                if batch_rel_idx_matches[b] is None or len(batch_rel_idx_matches[b]) == 0:
                     ma_skipped_batches.append(1)
-                    continue
                 else:
                     ma_skipped_batches.append(0)
 
@@ -275,17 +302,37 @@ def train(cfg):
                     else:
                         raise ValueError(f"Unknown padding filter mode: {cfg.padding_filter_mode}")
 
-                # reward calculation
                 if cfg.reward_type == "inlier":
                     reward = 0.5 if cfg.no_filtering_negatives and not label[b] else 1.0
                 elif cfg.reward_type == "inlier_ratio":
-                    ratio_inlier = ransac_inliers.sum() / len(abs_idx_matches) if len(abs_idx_matches) > 0 else 0.0
+                    ratio_inlier = float(ransac_inliers.sum()) / len(abs_idx_matches) if len(abs_idx_matches) > 0 else 0.0
                     reward = ratio_inlier
                 elif cfg.reward_type == "inlier+inlier_ratio":
-                    ratio_inlier = ransac_inliers.sum() / len(abs_idx_matches) if len(abs_idx_matches) > 0 else 0.0
+                    ratio_inlier = float(ransac_inliers.sum()) / len(abs_idx_matches) if len(abs_idx_matches) > 0 else 0.0
                     reward = (1.0 - beta) * 1.0 + beta * ratio_inlier
+                elif cfg.reward_type == "balanced":
+                    # Balanced reward: inlier rate + log-scaled inlier count only.
+                    # kp_density is intentionally excluded: get_rewards() negates reward
+                    # for negative pairs, so including kp_density would penalise keypoints
+                    # on 50% of batches → directly causes keypoint suppression.
+                    # The kp_count_floor regulariser handles anti-suppression separately.
+                    num_inliers = float(ransac_inliers.sum()) if ransac_inliers is not None else 0.0
+                    num_matches = len(abs_idx_matches) if abs_idx_matches is not None else 0
+                    inlier_rate = num_inliers / max(num_matches, 1)
+                    inlier_count_score = math.log1p(num_inliers) / math.log1p(50)  # 50 inliers = 1.0
+                    reward = 0.5 * inlier_rate + 0.5 * inlier_count_score
                 else:
                     raise ValueError(f"Unknown reward type: {cfg.reward_type}")
+
+                sum_raw_reward_batch += float(reward)
+
+                effective_reward_scale = cfg.reward_scale
+                if cfg.reward_scale_warmup_steps > 0:
+                    effective_reward_scale *= min(1.0, (i_step + 1) / cfg.reward_scale_warmup_steps)
+
+                effective_fp_penalty = fp_penalty
+                if cfg.fp_penalty_warmup_steps > 0:
+                    effective_fp_penalty *= min(1.0, (i_step + 1) / cfg.fp_penalty_warmup_steps)
 
                 dense_rewards = get_rewards(
                     reward,
@@ -299,13 +346,30 @@ def train(cfg):
                     abs_idx_matches,
                     ransac_inliers,
                     label[b] if label is not None else None,
-                    fp_penalty * alpha,
+                    effective_fp_penalty * alpha,
                     use_whitening=cfg.use_whitening,
                     selected_only=cfg.selected_only,
                     filter_mode=cfg.padding_filter_mode,
-                )
+                ) * effective_reward_scale
+
+                batch_mean = dense_rewards.mean()
+                batch_var = dense_rewards.var(unbiased=False)
+                
+                # Windowed RMS normalizer (last 500 steps)
+                reward_norm_mean_hist.append(batch_mean.item())
+                reward_norm_var_hist.append(batch_var.item())
+                
+                reward_norm_mean_val = sum(reward_norm_mean_hist) / len(reward_norm_mean_hist)
+                reward_norm_var_val = sum(reward_norm_var_hist) / len(reward_norm_var_hist)
+                
+                reward_norm_std = math.sqrt(reward_norm_var_val + cfg.reward_norm_eps)
+                dense_rewards = (dense_rewards - reward_norm_mean_val) / reward_norm_std
 
                 if descriptor_loss is not None:
+                    # Smooth linear annealing 2.0 → 1.0 over desc_margin_anneal_steps.
+                    # The old instant jump at step 500 caused the observed loss spike in results_80k.
+                    _anneal_steps = getattr(cfg, 'desc_margin_anneal_steps', 1000)
+                    descriptor_loss.pos_margin = 2.0 - 1.0 * min(1.0, i_step / max(_anneal_steps, 1))
                     hard_loss = descriptor_loss(
                         desc1=desc_1[b],
                         desc2=desc_2[b],
@@ -316,12 +380,12 @@ def train(cfg):
                         logits_2=None,
                     )
                     loss_desc_stack = (
-                        hard_loss if loss_desc_stack is None else torch.hstack((loss_desc_stack, hard_loss))
+                        hard_loss.unsqueeze(0) if loss_desc_stack is None else torch.cat((loss_desc_stack, hard_loss.unsqueeze(0)))
                     )
 
                 sum_reward_batch += dense_rewards.sum()
+                sum_inliers += ransac_inliers.sum().item() if ransac_inliers is not None else 0
 
-                # PPO: Compute value baseline for advantage estimation
                 if cfg.selected_only:
                     dense_values = (
                         values1[b][mask_selection_for_matching_1.bool()].view(-1, 1)
@@ -338,83 +402,291 @@ def train(cfg):
                     else:
                         raise ValueError(f"Unknown padding filter mode: {cfg.padding_filter_mode}")
 
-                # PPO advantage = reward - value baseline (reduces variance vs REINFORCE)
-                advantages = dense_rewards - dense_values.detach()
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-                current_loss_policy = (advantages * dense_logprobs).view(-1)
-                
-                # PPO value loss: train critic to predict returns
-                current_value_loss = F.mse_loss(dense_values, dense_rewards.detach())
                 loss_policy_stack = (
-                    current_loss_policy
+                    dense_logprobs.detach().view(-1)
                     if loss_policy_stack is None
-                    else torch.hstack((loss_policy_stack, current_loss_policy))
+                    else torch.cat((loss_policy_stack, dense_logprobs.detach().view(-1)))
+                )
+                loss_value_stack = (
+                    dense_values.detach().view(-1)
+                    if loss_value_stack is None
+                    else torch.cat((loss_value_stack, dense_values.detach().view(-1)))
+                )
+                loss_return_stack = (
+                    dense_rewards.detach().view(-1)
+                    if loss_return_stack is None
+                    else torch.cat((loss_return_stack, dense_rewards.detach().view(-1)))
                 )
 
-                if kp_penalty != 0.0:
+                sample_mask_selection_for_matching_1.append(mask_selection_for_matching_1)
+                sample_mask_selection_for_matching_2.append(mask_selection_for_matching_2)
+                sample_mask_padding_grid_1.append(mask_padding_grid_1[b] if mask_padding_grid_1 is not None else None)
+                sample_mask_padding_grid_2.append(mask_padding_grid_2[b] if mask_padding_grid_2 is not None else None)
+
+                effective_kp_penalty = kp_penalty
+                if cfg.kp_penalty_warmup_steps > 0:
+                    effective_kp_penalty *= min(1.0, (i_step + 1) / cfg.kp_penalty_warmup_steps)
+
+                if effective_kp_penalty != 0.0:
                     loss_kp = (
                         logprobs1[b][mask_selection_for_matching_1]
-                        * torch.full_like(logprobs1[b][mask_selection_for_matching_1], kp_penalty * alpha)
+                        * torch.full_like(logprobs1[b][mask_selection_for_matching_1], effective_kp_penalty * alpha)
                     ).mean() + (
                         logprobs2[b][mask_selection_for_matching_2]
-                        * torch.full_like(logprobs2[b][mask_selection_for_matching_2], kp_penalty * alpha)
+                        * torch.full_like(logprobs2[b][mask_selection_for_matching_2], effective_kp_penalty * alpha)
                     ).mean()
-                    loss_kp_stack = loss_kp if loss_kp_stack is None else torch.hstack((loss_kp_stack, loss_kp))
+                    loss_kp_stack = loss_kp.unsqueeze(0) if loss_kp_stack is None else torch.cat((loss_kp_stack, loss_kp.unsqueeze(0)))
 
                 sum_num_keypoints_1 += mask_selection_for_matching_1.sum()
                 sum_num_keypoints_2 += mask_selection_for_matching_2.sum()
 
-            # Skip step if no loss computed (no matches found)
-            if loss_policy_stack is None:
-                pbar.update()
-                msg = f"[Step {i_step+1}/{steps}] Skipped (no matches found)"
-                write_result(msg)
-                continue
+            # ====== Keypoint Count Floor Regularizer (Fix 2) ======
+            # Penalize the policy when detected keypoints fall below a minimum
+            # threshold — directly counteracts the suppression bias.
+            loss_kp_count = torch.tensor(0.0, device=p1.device)
+            kp_count_floor = getattr(cfg, 'kp_count_floor', 380)
+            kp_count_penalty = getattr(cfg, 'kp_count_penalty', 0.5)
+            kp_count_warmup = getattr(cfg, 'kp_count_warmup_steps', 500)
+            if kp_count_floor > 0 and i_step >= kp_count_warmup:
+                avg_kp_1 = sum_num_keypoints_1.float() / batch_size
+                avg_kp_2 = sum_num_keypoints_2.float() / batch_size
+                # Asymmetric quadratic penalty: only when BELOW floor
+                if avg_kp_1 < kp_count_floor:
+                    deficit_1 = (kp_count_floor - avg_kp_1) / kp_count_floor
+                    loss_kp_count = loss_kp_count + kp_count_penalty * (deficit_1 ** 2)
+                if avg_kp_2 < kp_count_floor:
+                    deficit_2 = (kp_count_floor - avg_kp_2) / kp_count_floor
+                    loss_kp_count = loss_kp_count + kp_count_penalty * (deficit_2 ** 2)
 
-            loss = loss_policy_stack.mean()
-            if loss_kp_stack is not None:
-                loss += loss_kp_stack.mean()
+            # ====== Descriptor Warmup Phase (Fix 4) ======
+            # During warmup, only train the descriptor head. PPO is skipped.
+            descriptor_warmup_steps = getattr(cfg, 'descriptor_warmup_steps', 0)
+            is_warmup = i_step < descriptor_warmup_steps
 
-            loss = -loss
+            if is_warmup:
+                # Warmup: train descriptor head only, skip PPO entirely
+                warmup_loss = torch.tensor(0.0, device=p1.device)
+                if loss_desc_stack is not None:
+                    warmup_loss = warmup_loss + cfg.desc_loss_weight * loss_desc_stack.mean()
+                # Also apply kp count regularizer during warmup
+                if loss_kp_count.item() > 0:
+                    warmup_loss = warmup_loss + loss_kp_count
+                if isinstance(warmup_loss, torch.Tensor) and warmup_loss.requires_grad:
+                    fabric.backward(warmup_loss)
+                    fabric.clip_gradients(net, optimizer=opt_pi, max_norm=cfg.gradient_clip_norm)
+                    opt_pi.step()
+                    opt_pi.zero_grad()
+                loss = warmup_loss.detach() if isinstance(warmup_loss, torch.Tensor) else torch.tensor(0.0, device=p1.device)
+                # Skip rollout buffer and PPO update
+            else:
+                # ====== Normal Training: Aux losses + PPO ======
+                # Apply auxiliary losses and step optimizer BEFORE PPO
+                aux_loss = torch.tensor(0.0, device=p1.device)
+                if loss_desc_stack is not None:
+                    aux_loss = aux_loss + cfg.desc_loss_weight * loss_desc_stack.mean()
+                if loss_kp_stack is not None:
+                    aux_loss = aux_loss + loss_kp_stack.mean()
+                # Add keypoint count floor penalty
+                if loss_kp_count.item() > 0:
+                    aux_loss = aux_loss + loss_kp_count
+                
+                if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
+                    fabric.backward(aux_loss)
+                    fabric.clip_gradients(net, optimizer=opt_pi, max_norm=cfg.gradient_clip_norm)
+                    opt_pi.step()
+                    opt_pi.zero_grad()
 
-            # PPO value loss (train critic)
-            if current_value_loss is not None:
-                loss += 0.5 * current_value_loss
+                if loss_return_stack is not None:
+                    loss_advantage_stack = loss_return_stack - loss_value_stack.detach()
+                    loss_advantage_stack = (loss_advantage_stack - loss_advantage_stack.mean()) / (loss_advantage_stack.std() + 1e-8)
+                else:
+                    loss_advantage_stack = None
 
-            if descriptor_loss is not None and loss_desc_stack is not None:
-                loss += cfg.desc_loss_weight * loss_desc_stack.mean()
+                # Store experience in rollout buffer only if matches found
+                if loss_policy_stack is not None:
+                    rollout_buffer.append({
+                        'logprobs': loss_policy_stack,
+                        'values': loss_value_stack,
+                        'rewards': loss_return_stack,
+                        'advantages': loss_advantage_stack,
+                        'desc_loss': None,
+                        'kp_loss': None,
+                        'p1': p1.cpu() if p1 is not None else None,
+                        'p2': p2.cpu() if p2 is not None else None,
+                        'choices1': choices1,
+                        'choices2': choices2,
+                        'accepted_choices1': accepted_choices1,
+                        'accepted_choices2': accepted_choices2,
+                        'mask_padding_1': mask_padding_1,
+                        'mask_padding_2': mask_padding_2,
+                        'sample_mask_selection_for_matching_1': sample_mask_selection_for_matching_1,
+                        'sample_mask_selection_for_matching_2': sample_mask_selection_for_matching_2,
+                        'sample_mask_padding_grid_1': sample_mask_padding_grid_1,
+                        'sample_mask_padding_grid_2': sample_mask_padding_grid_2,
+                    })
 
-            # Calculate metrics
-            mean_reward = sum_reward_batch / batch_size
-            avg_det_1 = sum_num_keypoints_1 / batch_size
-            avg_det_2 = sum_num_keypoints_2 / batch_size
-            
-            # Print clean progress line for every step
-            msg = f"[Step {i_step+1}/{steps}] Loss: {loss.item():.4f}, Reward: {mean_reward:.1f}, Det: ({avg_det_1:.0f}, {avg_det_2:.0f})"
-            write_result(msg)
+                # If rollout buffer is full, compute returns and advantages, then update
+                if len(rollout_buffer) >= cfg.rollout_steps:
+                    # Compute discounted returns and GAE (backwards)
+                    for i in reversed(range(len(rollout_buffer))):
+                        rewards = rollout_buffer[i]['rewards']
+                        values = rollout_buffer[i]['values']
+                        
+                        if i == len(rollout_buffer) - 1:
+                            next_values = torch.zeros_like(values)
+                            next_advantages = torch.zeros_like(rewards)
+                        else:
+                            next_values = rollout_buffer[i+1]['values']
+                            next_advantages = rollout_buffer[i+1]['advantages']
+                        
+                        # TD error
+                        delta = rewards + cfg.gamma * next_values - values
+                        
+                        # GAE
+                        advantages = delta + cfg.gae_lambda * cfg.gamma * next_advantages
+                        
+                        # Returns for value function
+                        returns = advantages + values
+                        
+                        rollout_buffer[i]['advantages'] = advantages
+                        rollout_buffer[i]['returns'] = returns
 
-            pbar.update()
+                    # PPO update
+                    old_logprobs_all = torch.cat([exp['logprobs'] for exp in rollout_buffer]).detach()
+                    old_advantages_all = torch.cat([exp['advantages'] for exp in rollout_buffer]).detach()
+                    old_returns_all = torch.cat([exp['returns'] for exp in rollout_buffer]).detach()
 
-            # backward + optimization
-            loss /= num_grad_accs
-            fabric.backward(loss)
+                    opt_pi.zero_grad()
+                    last_loss = None
 
-            if i_step % num_grad_accs == 0:
-                opt_pi.step()
-                opt_pi.zero_grad()
+                    for epoch in range(cfg.ppo_epochs):
+                        new_logprobs_all = []
+                        new_values_all = []
+                        entropy_terms = []
+
+                        for exp in rollout_buffer:
+                            p1_dev = exp['p1'].to(fabric.device)
+                            p2_dev = exp['p2'].to(fabric.device)
+                            
+                            logprobs1_new, values1_new, entropy1_new, _ = net.evaluate_actions(
+                                p1_dev, exp['choices1'], exp['accepted_choices1'], exp['mask_padding_1']
+                            )
+                            logprobs2_new, values2_new, entropy2_new, _ = net.evaluate_actions(
+                                p2_dev, exp['choices2'], exp['accepted_choices2'], exp['mask_padding_2']
+                            )
+
+                            new_logprobs = []
+                            new_values = []
+
+                            for b in range(batch_size):
+                                if exp['sample_mask_selection_for_matching_1'][b] is None:
+                                    continue
+
+                                if cfg.selected_only:
+                                    dense_logprobs_new = (
+                                        logprobs1_new[b][exp['sample_mask_selection_for_matching_1'][b].bool()].view(-1, 1)
+                                        + logprobs2_new[b][exp['sample_mask_selection_for_matching_2'][b].bool()].view(1, -1)
+                                    )
+                                    dense_values_new = (
+                                        values1_new[b][exp['sample_mask_selection_for_matching_1'][b].bool()].view(-1, 1)
+                                        + values2_new[b][exp['sample_mask_selection_for_matching_2'][b].bool()].view(1, -1)
+                                    )
+                                else:
+                                    if cfg.padding_filter_mode == "ignore":
+                                        dense_logprobs_new = (
+                                            logprobs1_new[b][exp['sample_mask_padding_grid_1'][b].bool()].view(-1, 1)
+                                            + logprobs2_new[b][exp['sample_mask_padding_grid_2'][b].bool()].view(1, -1)
+                                        )
+                                        dense_values_new = (
+                                            values1_new[b][exp['sample_mask_padding_grid_1'][b].bool()].view(-1, 1)
+                                            + values2_new[b][exp['sample_mask_padding_grid_2'][b].bool()].view(1, -1)
+                                        )
+                                    elif cfg.padding_filter_mode == "punish":
+                                        dense_logprobs_new = logprobs1_new[b].view(-1, 1) + logprobs2_new[b].view(1, -1)
+                                        dense_values_new = values1_new[b].view(-1, 1) + values2_new[b].view(1, -1)
+                                    else:
+                                        raise ValueError(f"Unknown padding filter mode: {cfg.padding_filter_mode}")
+
+                                new_logprobs.append(dense_logprobs_new.view(-1))
+                                new_values.append(dense_values_new.view(-1))
+                                entropy_terms.append((entropy1_new[b].mean() + entropy2_new[b].mean()) * 0.5)
+
+                            if len(new_logprobs) > 0:
+                                new_logprobs_all.extend(new_logprobs)
+                                new_values_all.extend(new_values)
+
+                        if len(new_logprobs_all) == 0:
+                            break
+
+                        new_logprobs_all = torch.cat(new_logprobs_all)
+                        new_values_all = torch.cat(new_values_all)
+                        entropy_bonus = torch.stack(entropy_terms).mean()
+
+                        ratio = torch.exp(new_logprobs_all - old_logprobs_all)
+                        current_clip_eps = 0.05 if i_step >= 5000 else cfg.ppo_clip_eps
+                        clipped_ratio = torch.clamp(ratio, 1.0 - current_clip_eps, 1.0 + current_clip_eps)
+                        policy_loss = -torch.min(ratio * old_advantages_all, clipped_ratio * old_advantages_all).mean()
+                        value_loss = F.mse_loss(new_values_all, old_returns_all)
+
+                        effective_entropy_coef = cfg.entropy_coef
+                        if cfg.entropy_coef_warmup_steps > 0:
+                            effective_entropy_coef *= min(1.0, (i_step + 1) / cfg.entropy_coef_warmup_steps)
+
+                        effective_value_loss_coef = cfg.value_loss_coef
+                        if cfg.value_loss_coef_warmup_steps > 0:
+                            effective_value_loss_coef *= min(1.0, (i_step + 1) / cfg.value_loss_coef_warmup_steps)
+
+                        epoch_loss = policy_loss + effective_value_loss_coef * value_loss - effective_entropy_coef * entropy_bonus
+
+                        fabric.backward(epoch_loss)
+                        fabric.clip_gradients(net, optimizer=opt_pi, max_norm=cfg.gradient_clip_norm)
+                        opt_pi.step()
+                        opt_pi.zero_grad()
+
+                        last_loss = epoch_loss.detach()
+
+                    loss = last_loss if last_loss is not None else torch.tensor(0.0, device=p1.device)
+                    # Clear rollout buffer
+                    rollout_buffer = []
+                    gc.collect()
+
+                else:
+                    loss = torch.tensor(0.0, device=p1.device)  # No update yet
+
+            # ====== Periodic Checkpoint Saving (Fix 5) ======
+            checkpoint_interval = getattr(cfg, 'checkpoint_interval', 5000)
+            if checkpoint_interval > 0 and (i_step + 1) % checkpoint_interval == 0:
+                raw_state = net.state_dict()
+                clean_state = {k.replace("_forward_module.", ""): v for k, v in raw_state.items()}
+                ckpt_path = output_dir / f"checkpoint_step_{i_step+1}.pt"
+                torch.save(clean_state, ckpt_path)
+                write_result(f"[Checkpoint] Saved to {ckpt_path}")
 
             # logging
+            reward_value = sum_raw_reward_batch / batch_size
+            det_1 = int((sum_num_keypoints_1.item() if hasattr(sum_num_keypoints_1, "item") else sum_num_keypoints_1) / batch_size)
+            det_2 = int((sum_num_keypoints_2.item() if hasattr(sum_num_keypoints_2, "item") else sum_num_keypoints_2) / batch_size)
+            inliers_avg = sum_inliers / batch_size
+            desc_l = loss_desc_stack.mean().item() if loss_desc_stack is not None else 0.0
+            kp_count_l = loss_kp_count.item() if isinstance(loss_kp_count, torch.Tensor) else 0.0
+            phase = "WARMUP" if is_warmup else "PPO"
+            
+            write_result(f"[Step {i_step+1}/{steps}] [{phase}] PPO Loss: {loss.item():.4f}, Desc Loss: {desc_l:.4f}, KP Floor: {kp_count_l:.4f}, Reward: {reward_value:.4f}, Inliers: {inliers_avg:.1f}, Det: ({det_1}, {det_2})")
+
             if i_step % cfg.log_interval == 0:
+                det1_log = int(sum_num_keypoints_1.item() / batch_size) if hasattr(sum_num_keypoints_1, "item") else int(sum_num_keypoints_1 / batch_size)
+                det2_log = int(sum_num_keypoints_2.item() / batch_size) if hasattr(sum_num_keypoints_2, "item") else int(sum_num_keypoints_2 / batch_size)
+                reward_log = (sum_reward_batch.item() if hasattr(sum_reward_batch, "item") else float(sum_reward_batch)) / batch_size
+                
                 wandb_logger.log(
                     {
                         "loss": loss.item(),
-                        "loss_policy": -loss_policy_stack.mean().item(),
+                        "loss_policy": -loss_policy_stack.mean().item() if loss_policy_stack is not None else 0.0,
                         "loss_kp": loss_kp_stack.mean().item() if loss_kp_stack is not None else 0.0,
                         "loss_hard": (loss_desc_stack.mean().item() if loss_desc_stack is not None else 0.0),
-                        "mean_num_det_kpts1": sum_num_keypoints_1 / batch_size,
-                        "mean_num_det_kpts2": sum_num_keypoints_2 / batch_size,
-                        "mean_reward": sum_reward_batch / batch_size,
+                        "mean_num_det_kpts1": det1_log,
+                        "mean_num_det_kpts2": det2_log,
+                        "mean_reward": reward_log,
                         "lr": opt_pi.param_groups[0]["lr"],
                         "ma_skipped_batches": sum(ma_skipped_batches) / len(ma_skipped_batches),
                         "inl_th": inl_th,
