@@ -89,6 +89,7 @@ class KeypointSampler(nn.Module):
         accepted_choices = flipper.sample()
 
         log_probs = chooser.log_prob(choices) + flipper.log_prob(accepted_choices)
+        entropy = chooser.entropy() + flipper.entropy()
 
         accept_mask = accepted_choices.gt(0)
 
@@ -98,6 +99,8 @@ class KeypointSampler(nn.Module):
             accept_mask.squeeze(1),
             logits_selected.squeeze(1),
             values.squeeze(1),   # for GAE
+            entropy.squeeze(1),
+            accepted_choices,
         )
 
     def precompute_idx_cells(self, H, W, device):
@@ -126,19 +129,29 @@ class KeypointSampler(nn.Module):
         if self.idx_cells is None or self.idx_cells.shape[2:4] != (H // self.window_size, W // self.window_size):
             self.idx_cells = self.precompute_idx_cells(H, W, x.device)
 
-        log_probs, idx, mask, logits_selected, values = self.sample(keypoint_cells)
+        log_probs, choices, mask, logits_selected, values, entropy, accepted_choices = self.sample(keypoint_cells)
 
         keypoints = (
             torch.gather(
                 self.idx_cells.expand(B, -1, -1, -1, -1),
                 -1,
-                idx.repeat(1, 2, 1, 1).unsqueeze(-1),
+                choices.repeat(1, 2, 1, 1).unsqueeze(-1),
             )
             .squeeze(-1)
             .permute(0, 2, 3, 1)
         )
 
-        return keypoints.flip(-1), log_probs, mask, mask_padding, logits_selected, values
+        return (
+            keypoints.flip(-1),
+            log_probs,
+            mask,
+            mask_padding,
+            logits_selected,
+            values,
+            entropy,
+            choices.view(B, -1),
+            accepted_choices.view(B, -1),
+        )
 
 
 ###############################################################
@@ -299,7 +312,7 @@ class RIPE(nn.Module):
         out["heatmap"] = self.non_linearity_dect(out["heatmap"])
 
         if training:
-            kpts, log_probs, mask, mask_padding, logits_selected, values = self.detector(
+            kpts, log_probs, mask, mask_padding, logits_selected, values, entropy, choices, accepted_choices = self.detector(
                 out["heatmap"], mask_padding
             )
 
@@ -319,10 +332,68 @@ class RIPE(nn.Module):
                 mask_padding.view(B, -1) if mask_padding is not None else None,
                 logits_selected.view(B, -1),
                 values.view(B, -1),
+                entropy.view(B, -1),
+                choices,
+                accepted_choices,
                 out,
             )
         else:
             return out
+
+    ###############################################################
+    # PPO EVALUATION (for old policy re-evaluation)
+    ###############################################################
+
+    def evaluate_actions(self, x, choices, accepted_choices, mask_padding=None):
+        """Evaluate log probs and values for given actions (for PPO)"""
+        B, C, H, W = x.shape
+
+        out = self.net(x)
+        out["heatmap"] = self.non_linearity_dect(out["heatmap"])
+
+        # Get the grid for evaluation
+        keypoint_cells = gridify(out["heatmap"], self.window_size)
+
+        if mask_padding is not None:
+            mask_padding_grid = torch.min(gridify(mask_padding, self.window_size), dim=4).values
+        else:
+            mask_padding_grid = None
+
+        if self.detector.idx_cells is None or self.detector.idx_cells.shape[2:4] != (H // self.window_size, W // self.window_size):
+            self.detector.idx_cells = self.detector.precompute_idx_cells(H, W, x.device)
+
+        # Flatten keypoint_cells so each spatial location has a category vector
+        # keypoint_cells has shape [B, C, grid_h, grid_w, num_cells] from gridify
+        B_size, C, grid_h, grid_w, num_cells = keypoint_cells.shape
+        # Squeeze C dimension (should be 1 for heatmap) and reshape to [B, grid_h*grid_w, num_cells]
+        keypoint_cells = keypoint_cells.squeeze(1)  # [B, grid_h, grid_w, num_cells]
+        keypoint_cells_flat = keypoint_cells.reshape(B_size, grid_h * grid_w, num_cells)
+
+        # choices comes in shape [B, grid_h * grid_w]
+        choices_flat = choices.view(B_size, -1).unsqueeze(-1)
+
+        logits_selected = keypoint_cells_flat.gather(1, choices_flat).squeeze(-1)
+
+        # PPO decision evaluation
+        policy_input = logits_selected.unsqueeze(-1)
+        probs, values = self.detector.policy(policy_input)
+
+        probs = probs.squeeze(-1)
+        values = values.squeeze(-1)
+
+        # Compute log probs for the given actions
+        chooser = torch.distributions.Categorical(logits=keypoint_cells_flat)
+        flipper = torch.distributions.Bernoulli(probs)
+
+        log_probs = chooser.log_prob(choices)
+        entropy = chooser.entropy() + flipper.entropy()
+
+        return (
+            log_probs.squeeze(1),
+            values.squeeze(1),
+            entropy.squeeze(1),
+            out,
+        )
 
 
 ###############################################################

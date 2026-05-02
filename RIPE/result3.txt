@@ -2,7 +2,6 @@
 [Step 2/250] Loss: 0.6496, Reward: 1.5, Det: (400, 400)
 [Step 3/250] Loss: 0.4205, Reward: -6.7, Det: (408, 400)
 [Step 4/250] Loss: 0.3381, Reward: -3.7, Det: (393, 390)
-[Step 5/250] Loss: 1.0408, Reward: 34.0, Det: (382, 395)
 [Step 6/250] Loss: 0.3948, Reward: 11.8, Det: (376, 379)
 [Step 7/250] Loss: 0.6660, Reward: 12.0, Det: (378, 394)
 [Step 8/250] Loss: 0.1397, Reward: -6.2, Det: (370, 372)

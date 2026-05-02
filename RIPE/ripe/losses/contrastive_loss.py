@@ -16,6 +16,23 @@ def contrastive_loss(
     logits_1=None, logits_2=None,
     pos_margin=1.0, neg_margin=1.0,
 ):
+    # Guard against empty matches — use self-similarity diversity fallback
+    # instead of returning tensor(0.0) which has no grad_fn and causes
+    # chaotic zero-spikes in descriptor loss.
+    if len(matches) == 0 or len(inliers) == 0 or len(matches) != len(inliers):
+        if desc1.shape[0] >= 2:
+            # Diversity regularization: push random descriptor pairs apart
+            n = min(desc1.shape[0], 64)
+            idx = torch.randperm(desc1.shape[0], device=desc1.device)[:n]
+            sampled = desc1[idx]
+            dists = torch.cdist(sampled, sampled, p=2)
+            # Penalize descriptors that are too close (off-diagonal only)
+            mask = ~torch.eye(n, dtype=torch.bool, device=desc1.device)
+            fallback_loss = torch.clamp(neg_margin - dists[mask], min=0.0).mean()
+            return fallback_loss * 0.1  # Scale down so it doesn't dominate
+        # Last resort: return a tensor that still has requires_grad=True
+        return torch.tensor(0.0, device=desc1.device, requires_grad=True)
+
     if inliers.sum() < 8:
         inliers = torch.ones_like(inliers)
 

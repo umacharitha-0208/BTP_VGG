@@ -14,7 +14,7 @@ class PoseLibRelativePoseEstimator:
         F, info = poselib.estimate_fundamental(
             pts0.cpu().numpy(),
             pts1.cpu().numpy(),
-            {"max_epipolar_error": adaptive_th, "max_iterations": 1000, "min_iterations": 100},
+            {"max_epipolar_error": adaptive_th, "max_iterations": 300, "min_iterations": 30},
         )
 
         success = F is not None

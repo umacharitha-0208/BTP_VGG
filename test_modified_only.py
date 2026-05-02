@@ -31,14 +31,14 @@ except FileNotFoundError:
 import os
 import glob
 
-# Import from test_models
+# Import from RIPE package
 try:
-    from test_models import ModelEvaluator
+    from RIPE.test_models import ModelEvaluator
 except ModuleNotFoundError:
-    repo_test_models_dir = Path(__file__).resolve().parent / "RIPE"
-    if str(repo_test_models_dir) not in sys.path:
-        sys.path.append(str(repo_test_models_dir))
-    from test_models import ModelEvaluator
+    repo_root_dir = Path(__file__).resolve().parent
+    if str(repo_root_dir) not in sys.path:
+        sys.path.append(str(repo_root_dir))
+    from RIPE.test_models import ModelEvaluator
 
 def find_latest_checkpoint():
     """Find the latest trained PPO model checkpoint"""

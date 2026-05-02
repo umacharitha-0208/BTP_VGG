@@ -1,2 +1,2 @@
 _target_: ripe.scheduler.constant.ConstantScheduler
-value: 1.0
+value: 0.1

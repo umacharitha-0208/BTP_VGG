@@ -110,24 +110,35 @@ def get_rewards(
 
         dense_returns = torch.zeros((len(kps1), len(kps2)), device=kps1.device)
 
-        if filter_mode == "ignore":
-            dense_returns[
-                abs_idx_matches[:, 0][ransac_inliers],
-                abs_idx_matches[:, 1][ransac_inliers],
-            ] = reward
-        elif filter_mode == "punish":
-            in_padding_area = (
-                padding_mask1[abs_idx_matches[:, 0]] & padding_mask2[abs_idx_matches[:, 1]]
-            )  # both in the image area (not in padding area)
+        # Guard against empty matches or shape mismatch
+        if len(abs_idx_matches) == 0 or len(ransac_inliers) == 0:
+            inlier_mask_valid = False
+        else:
+            try:
+                inlier_mask_valid = (len(abs_idx_matches) == len(ransac_inliers))
+            except:
+                inlier_mask_valid = False
 
-            dense_returns[
-                abs_idx_matches[:, 0][ransac_inliers & in_padding_area],
-                abs_idx_matches[:, 1][ransac_inliers & in_padding_area],
-            ] = reward
-            dense_returns[
-                abs_idx_matches[:, 0][ransac_inliers & ~in_padding_area],
-                abs_idx_matches[:, 1][ransac_inliers & ~in_padding_area],
-            ] = -1.0
+        if filter_mode == "ignore":
+            if inlier_mask_valid and len(abs_idx_matches) > 0:
+                dense_returns[
+                    abs_idx_matches[:, 0][ransac_inliers],
+                    abs_idx_matches[:, 1][ransac_inliers],
+                ] = reward
+        elif filter_mode == "punish":
+            if inlier_mask_valid and len(abs_idx_matches) > 0:
+                in_padding_area = (
+                    padding_mask1[abs_idx_matches[:, 0]] & padding_mask2[abs_idx_matches[:, 1]]
+                )  # both in the image area (not in padding area)
+
+                dense_returns[
+                    abs_idx_matches[:, 0][ransac_inliers & in_padding_area],
+                    abs_idx_matches[:, 1][ransac_inliers & in_padding_area],
+                ] = reward
+                dense_returns[
+                    abs_idx_matches[:, 0][ransac_inliers & ~in_padding_area],
+                    abs_idx_matches[:, 1][ransac_inliers & ~in_padding_area],
+                ] = -1.0
         else:
             raise ValueError(f"Unknown filter mode: {filter_mode}")
 
