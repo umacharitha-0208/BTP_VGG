@@ -131,26 +131,23 @@ class VGG19(nn.Module):
         sizes = []
         
         if self.use_gradient_checkpointing and self.training:
-            # Use gradient checkpointing to save memory
-            # Split into 4 blocks at maxpool boundaries: [0-6], [7-13], [14-26], [27-40]
-            block_boundaries = [0, 7, 14, 27, 40]
-            
-            for i in range(len(block_boundaries) - 1):
-                start, end = block_boundaries[i], block_boundaries[i + 1]
-                
-                # Store features before maxpool
-                if i > 0:  # Skip first iteration (no maxpool before first block)
-                    feats.append(x)
-                    sizes.append(x.shape[-2:])
-                
-                # Use checkpointing for this block
+            # Maxpool layers at indices 6, 13, 26, 39
+            # Process each conv block up to (but not including) its maxpool,
+            # save the feature, then apply the maxpool separately.
+            conv_segments = [(0, 6), (7, 13), (14, 26), (27, 39)]
+            maxpool_indices = [6, 13, 26, 39]
+
+            for (start, end), pool_idx in zip(conv_segments, maxpool_indices):
                 x = checkpoint.checkpoint(
                     self._forward_block,
                     x,
                     start,
                     end,
-                    use_reentrant=False
+                    use_reentrant=False,
                 )
+                feats.append(x)
+                sizes.append(x.shape[-2:])
+                x = self.layers[pool_idx](x)
         else:
             # Standard forward pass
             for layer in self.layers:

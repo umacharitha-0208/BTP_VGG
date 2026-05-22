@@ -24,6 +24,46 @@ log = get_pylogger(__name__)
 
 
 ###############################################################
+# ATTENTION DESCRIPTOR HEAD
+###############################################################
+
+class DescriptorAttentionHead(nn.Module):
+    """Lightweight attention-based descriptor projection.
+
+    Replaces the original 1×1 Conv (which projects each keypoint independently)
+    with a projection + one self-attention layer so keypoints can reference
+    each other for context-aware, disambiguated descriptors.
+
+    Architecture:
+        Linear(in_dim → out_dim) → MHA(out_dim) + residual → LayerNorm
+        → 2-layer FFN + residual → LayerNorm → L2 norm
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, nhead: int = 4):
+        super().__init__()
+        self.proj  = nn.Linear(in_dim, out_dim)
+        self.attn  = nn.MultiheadAttention(out_dim, nhead, batch_first=True, dropout=0.0)
+        self.norm1 = nn.LayerNorm(out_dim)
+        self.ff    = nn.Sequential(
+            nn.Linear(out_dim, out_dim * 2),
+            nn.GELU(),
+            nn.Linear(out_dim * 2, out_dim),
+        )
+        self.norm2 = nn.LayerNorm(out_dim)
+
+        nn.init.orthogonal_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, in_dim)
+        x = self.proj(x)                         # (B, N, out_dim)
+        h, _ = self.attn(x, x, x)
+        x = self.norm1(x + h)
+        x = self.norm2(x + self.ff(x))
+        return F.normalize(x, dim=-1)
+
+
+###############################################################
 # PPO POLICY NETWORK (Improved for stability)
 ###############################################################
 
@@ -167,6 +207,7 @@ class RIPE(nn.Module):
         non_linearity_dect=None,
         desc_shares: Optional[List[int]] = None,
         descriptor_dim: int = 256,
+        use_attention_descriptor: bool = True,
         device=None,
     ):
         super().__init__()
@@ -177,21 +218,31 @@ class RIPE(nn.Module):
 
         self.window_size = window_size
         self.non_linearity_dect = non_linearity_dect if non_linearity_dect else nn.Identity()
+        self.use_attention_descriptor = use_attention_descriptor
 
         log.info(f"Training with window size {window_size}.")
 
         dim_coarse_desc = self.get_dim_raw_desc()
+        in_dim = sum(dim_coarse_desc)
 
-        if desc_shares is not None:
+        if use_attention_descriptor:
+            # Attention head: projects + self-attends over all keypoints for
+            # context-aware descriptors — improvement over independent 1×1 conv.
+            self.conv_dim_reduction_coarse_desc = DescriptorAttentionHead(
+                in_dim=in_dim, out_dim=descriptor_dim, nhead=4
+            )
+            log.info("Descriptor head: DescriptorAttentionHead (attention-based)")
+        elif desc_shares is not None:
             self.conv_dim_reduction_coarse_desc = nn.ModuleList()
             for dim_in, dim_out in zip(dim_coarse_desc, desc_shares):
                 self.conv_dim_reduction_coarse_desc.append(
                     nn.Conv1d(dim_in, dim_out, kernel_size=1)
                 )
         else:
-            self.conv_dim_reduction_coarse_desc = nn.Conv1d(
-                sum(dim_coarse_desc), descriptor_dim, kernel_size=1
-            )
+            self.conv_dim_reduction_coarse_desc = nn.Conv1d(in_dim, descriptor_dim, kernel_size=1)
+            nn.init.orthogonal_(self.conv_dim_reduction_coarse_desc.weight)
+            nn.init.zeros_(self.conv_dim_reduction_coarse_desc.bias)
+            log.info("Descriptor head: Conv1d 1×1 (orthogonal init)")
 
     def get_dim_raw_desc(self):
         layers_dims_encoder = self.net.get_dim_layers_encoder()
@@ -290,14 +341,17 @@ class RIPE(nn.Module):
 
     def get_descs(self, feature_map, guidance, kpts, H, W):
         descs = self.upsampler(feature_map, kpts, H, W)
-        desc = torch.cat(descs, dim=-1)
+        desc = torch.cat(descs, dim=-1)   # (B, N, in_dim)
 
-        desc = self.conv_dim_reduction_coarse_desc(
-            desc.permute(0, 2, 1)
-        ).permute(0, 2, 1)
-
-        # Descriptor L2 normalization (important fix from image 4)
-        desc = F.normalize(desc, dim=2)
+        if self.use_attention_descriptor:
+            # DescriptorAttentionHead: (B, N, in_dim) → (B, N, out_dim), already L2-normalised
+            desc = self.conv_dim_reduction_coarse_desc(desc)
+        else:
+            # Conv1d path: needs (B, in_dim, N)
+            desc = self.conv_dim_reduction_coarse_desc(
+                desc.permute(0, 2, 1)
+            ).permute(0, 2, 1)
+            desc = F.normalize(desc, dim=2)
 
         return desc
 
@@ -370,9 +424,10 @@ class RIPE(nn.Module):
         keypoint_cells_flat = keypoint_cells.reshape(B_size, grid_h * grid_w, num_cells)
 
         # choices comes in shape [B, grid_h * grid_w]
-        choices_flat = choices.view(B_size, -1).unsqueeze(-1)
+        choices_flat = choices.view(B_size, -1).unsqueeze(-1)  # [B, grid_h*grid_w, 1]
 
-        logits_selected = keypoint_cells_flat.gather(1, choices_flat).squeeze(-1)
+        # BUG1 FIX: gather along dim=2 (cell values), not dim=1 (spatial locations)
+        logits_selected = keypoint_cells_flat.gather(2, choices_flat).squeeze(-1)  # [B, grid_h*grid_w]
 
         # PPO decision evaluation
         policy_input = logits_selected.unsqueeze(-1)
@@ -385,7 +440,10 @@ class RIPE(nn.Module):
         chooser = torch.distributions.Categorical(logits=keypoint_cells_flat)
         flipper = torch.distributions.Bernoulli(probs)
 
-        log_probs = chooser.log_prob(choices)
+        # BUG2 FIX: include flipper log_prob — sample() uses chooser + flipper,
+        # evaluate_actions must match exactly so the importance ratio is correct.
+        accepted_choices_flat = accepted_choices.view(B_size, -1).float()
+        log_probs = chooser.log_prob(choices) + flipper.log_prob(accepted_choices_flat)
         entropy = chooser.entropy() + flipper.entropy()
 
         return (

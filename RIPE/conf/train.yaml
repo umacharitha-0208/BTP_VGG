@@ -3,7 +3,7 @@ defaults:
   - backbones: vgg
   - upsampler: hypercolumn_features # interpolate_sparse2D
   - matcher: concurrent_mnn_poselib
-  - descriptor_loss: contrastive_loss # none to deactivate
+  - descriptor_loss: infonce_loss   # InfoNCE: non-zero gradient even without RANSAC matches
   - inl_th: constant # exp_decay
   - _self_
 
@@ -19,98 +19,102 @@ hydra:
 output_dir: ./outputs/${project_name}/${name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 num_gpus: 1
-# precision: "32-true"
-# precision: "bf16-mixed" # numerically more stable
-precision: "32-true" # Faster for CPU training fallback
-# precision: "16-mixed"
+# ── Precision (bf16-mixed is fastest on modern GPUs with no accuracy loss) ─
+precision: "bf16-mixed"   # GPU run — halves VRAM, speeds up VGG conv by 2x
+# precision: "32-true"    # fallback if GPU doesn't support bf16 (e.g. older V100)
 
-log_interval: 100 # log every N steps/ batches
-wandb_mode: disabled
-val_interval: 5000
+log_interval: 500         # log every 500 steps → 160 log entries over 80k
+wandb_mode: disabled       # set to "online" if using W&B for experiment tracking
+val_interval: 5000         # validate every 5k steps → 16 validation points
 conf_inference:
   threshold: 0.5
   top_k: 2048
 
-desc_loss_weight: 0.3  # was 1.0; high weight amplified margin-jump spikes
-reward_scale: 0.5      # was 0.3; stronger RL signal
-reward_scale_warmup_steps: 1000  # was 2000
-reward_norm_momentum: 0.995
-reward_norm_eps: 1e-6
-entropy_coef: 0.001    # was 0.0005; more exploration to escape plateau
-entropy_coef_warmup_steps: 1000  # was 2000
+# ── Loss weights ────────────────────────────────────────────────────────────
+desc_loss_weight: 0.5        # InfoNCE balanced with PPO reward signal
+
+# ── Reward scaling ──────────────────────────────────────────────────────────
+reward_scale: 1.0
+reward_scale_warmup_steps: 400    # 0.5% of 80k — policy initialises from scratch
+reward_norm_momentum: 0.99
+reward_norm_eps: 1e-5
+
+# ── PPO hyperparameters ─────────────────────────────────────────────────────
+entropy_coef: 0.001               # lower entropy at full scale — policy more deterministic
+entropy_coef_warmup_steps: 800
 value_loss_coef: 0.5
-value_loss_coef_warmup_steps: 1000  # was 2000
-ppo_epochs: 1
-ppo_clip_eps: 0.2      # was 0.15; slightly wider clip for early learning
+value_loss_coef_warmup_steps: 800
+ppo_epochs: 2
+ppo_clip_eps: 0.1                 # tight clip — prevents large policy updates
 gamma: 0.99
 gae_lambda: 0.95
 rollout_steps: 1
-lr_warmup_steps: 500   # was 2000; shorter warmup relative to 5000 total steps
-kp_penalty_warmup_steps: 500   # was 2000
-fp_penalty_warmup_steps: 500   # was 2000
-gradient_clip_norm: 1.0  # was 0.5; allow more gradient flow during desc warmup
 
-num_workers: 0
-batch_size: 2   # was 4; halves memory and per-step compute
+# ── Optimiser & gradient ────────────────────────────────────────────────────
+lr_warmup_steps: 800              # 1% of 80k — gradual warmup for full VGG
+kp_penalty_warmup_steps: 800
+fp_penalty_warmup_steps: 800
+gradient_clip_norm: 1.0
+
+# ── DataLoader ──────────────────────────────────────────────────────────────
+# num_workers and batch_size are OVERRIDDEN by conf/data/imw2022.yaml
+# Set them here only as fallback defaults
+num_workers: 0    # 0 = main process only; avoids Windows CUDA hang
+batch_size: 2
 
 transformation_model: fundamental
 
+# ── Network ─────────────────────────────────────────────────────────────────
 network:
   _target_: ripe.models.ripe.RIPE
   _partial_: true
   window_size: 8
+  use_attention_descriptor: true   # DescriptorAttentionHead (context-aware descriptors)
   non_linearity_dect:
     _target_: torch.nn.Identity
-    # _target_: torch.nn.ReLU
-  desc_shares:
-    null
-    # - 64
-    # - 64
-    # - 64
-    # - 64
+  desc_shares: null
 
-lr: 0.00003  # was 0.00005; lower for better stability with larger gradient_clip_norm
+# ── Learning rate — scaled for full VGG + PPO stability ────────────────────
+lr: 0.0001                         # 2× smoke test lr; safe upper bound for PPO
 fp_penalty: -1e-8
 kp_penalty: -1e-7
-num_grad_accs: 8
-reward_type: balanced # balanced | inlier_ratio | inlier+inlier_ratio
+num_grad_accs: 8                   # effective batch = batch_size(2) × 8 = 16 (same as before with batch=4×4)
+reward_type: balanced
 no_filtering_negatives: False
 descriptor_dim: 256
 
 lr_scheduler:
   _partial_: true
   _target_: ripe.scheduler.linearLR.StepLinearLR
-  num_steps: ${num_steps}
+  num_steps: ${num_steps}          # auto-scales to 80000
   initial_lr: ${lr}
-  final_lr: 1e-6
+  final_lr: 1e-6                   # same final lr as original RIPE
 
 use_whitening: false
-
 selected_only: false
-
 padding_filter_mode: ignore
-# padding_filter_mode: punish
 
-num_steps: 250   # SMOKE TEST — change to 5000 for full training run
+# ── Training length ─────────────────────────────────────────────────────────
+num_steps: 1500   # test run — change to 80000 for full training
 
-# ====== Mitigation Parameters ======
+# ── Keypoint count floor regularizer ────────────────────────────────────────
+# Scales with resolution: 384px → ~900 cells → floor=380
+# For 560px: floor~700; for 448px: floor~500; for 320px: floor~200
+kp_count_floor: 380          # adjust per image_size (see comment above)
+kp_count_penalty: 0.5
+kp_count_warmup_steps: 1600  # 2% of 80k — allow policy to stabilise first
 
-# Keypoint count floor regularizer
-kp_count_floor: 450          # was 380; raise floor to force more keypoints
-kp_count_penalty: 1.0        # was 0.5; stronger anti-suppression signal
-kp_count_warmup_steps: 200   # was 500; start penalizing suppression sooner
+# ── Descriptor warmup ───────────────────────────────────────────────────────
+descriptor_warmup_steps: 0   # InfoNCE + synthetic pairs handle cold start
 
-# Descriptor warmup phase: train descriptor head alone before PPO kicks in.
-descriptor_warmup_steps: 50   # SMOKE TEST: 20% warmup (50/250); change to 500 for full run
+# ── Margin annealing (InfoNCE fallback, kept for compatibility) ─────────────
+desc_margin_anneal_steps: 8000
 
-# Smooth descriptor margin annealing (pos_margin 2.0 → 1.0 over this many steps)
-# replaces the sudden jump at step 500 that caused loss spikes
-desc_margin_anneal_steps: 1000
+# ── Checkpointing ───────────────────────────────────────────────────────────
+checkpoint_interval: 8000    # save every 8k steps — keeps 10 checkpoints over 80k run
 
-# Periodic checkpoint saving
-checkpoint_interval: 250     # SMOKE TEST: save at end; change to 1000 for full run
-
-alpha_scheduler: # 1.0 after 1/3 of the steps
+# ── Alpha/beta schedulers ───────────────────────────────────────────────────
+alpha_scheduler:  # fp_penalty ramps to 1.0 after first 20% of training
   _target_: ripe.scheduler.linear_with_plateaus.LinearWithPlateaus
   start_val: 0.0
   end_val: 1.0
@@ -118,7 +122,7 @@ alpha_scheduler: # 1.0 after 1/3 of the steps
   rel_length_start_plateau: 0.2
   rel_length_end_plateu: 0.2
 
-beta_scheduler: # linear increase over all steps
+beta_scheduler:   # inlier-ratio blend increases linearly
   _target_: ripe.scheduler.linear_with_plateaus.LinearWithPlateaus
   start_val: 0.0
   end_val: 0.5

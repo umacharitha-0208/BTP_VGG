@@ -3,5 +3,5 @@ nchannels: 3
 pretrained: True
 use_instance_norm: False
 mode: dect
-use_gradient_checkpointing: True  # recompute activations during backward → big memory saving
-freeze_layers: 25  # was 10; VGG19 has 40 layers; freeze bottom 25 = less backward compute
+use_gradient_checkpointing: True  # recompute activations during backward — critical for full VGG on GPU
+freeze_layers: 10                 # freeze first 10 layers — same as original RIPE training

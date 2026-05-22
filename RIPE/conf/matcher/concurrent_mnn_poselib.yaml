@@ -1,8 +1,9 @@
 _target_: ripe.matcher.concurrent_matcher.ConcurrentMatcher
-min_num_matches: 4
+min_num_matches: 2
+top_k: 1024  # increased for higher-res GPU training (384-560px → ~900-1800 keypoints per image)
 matcher:
   _target_: kornia.feature.DescriptorMatcher
   match_mode: "mnn"
-  th: 0.7
+  th: 1.0   # disable ratio test in Kornia MNN — LO-RANSAC handles outlier rejection
 robust_estimator:
   _target_: ripe.matcher.pose_estimator_poselib.PoseLibRelativePoseEstimator

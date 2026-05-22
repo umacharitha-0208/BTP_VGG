@@ -6,13 +6,19 @@ name: imw2022
 
 _target_: ripe.data.datasets.imw2022.get_imw2022
 
-root_dir: C:\Users\linga\Downloads\imw2022
+root_dir: C:\Users\linga\Downloads\BTP_DATASET
 
-image_size: 192   # was 256; (192/256)²=0.56 → 44% fewer pixels through all VGG layers
+# ── Resolution tiers (uncomment the one matching your GPU) ──────────────────
+# image_size: 560   # Original RIPE resolution — A100 40GB+ (batch 4-6)
+# image_size: 448   # RTX 3090/4090 24GB        (batch 2-4)
+image_size: 384     # RTX 3080/4080 16GB         (batch 2)     ← default
+# image_size: 320   # RTX 3060/4060 12GB         (batch 2)
+
 positive_ratio: 0.5
+synthetic_ratio: 0.10  # 10% synthetic at full scale — real pairs dominate
 
-batch_size: 4               # ← adjust to your GPU memory
-num_workers: 0
-pin_memory: false
+batch_size: 2               # RTX 5060 8GB — safe with bf16+grad_checkpoint (batch 4 risks OOM)
+num_workers: 0              # 0 = main process only; avoids Windows CUDA multiprocessing hang
+pin_memory: true            # fast CPU→GPU transfers
 shuffle: true
 drop_last: true

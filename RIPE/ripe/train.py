@@ -1,6 +1,11 @@
+import multiprocessing
 import pyrootutils
 import sys
 from pathlib import Path
+
+# Windows requires spawn context for DataLoader workers with CUDA
+if sys.platform == "win32":
+    multiprocessing.set_start_method("spawn", force=True)
 
 try:
     root = pyrootutils.setup_root(
@@ -45,6 +50,44 @@ from ripe.utils import get_pylogger
 from ripe.utils.utils import get_rewards
 from ripe.utils.wandb_utils import get_flattened_wandb_cfg
 
+
+def _synthetic_inliers(kpts1, kpts2, H_matrix, threshold=8.0):
+    """Compute inlier matches directly from a known homography (no RANSAC needed).
+
+    Projects every keypoint in kpts1 through H, then finds the nearest keypoint
+    in kpts2. Pairs within `threshold` pixels are inliers.
+
+    Args:
+        kpts1:    (N, 2) float tensor of [x, y] pixel coords in image 1
+        kpts2:    (M, 2) float tensor of [x, y] pixel coords in image 2
+        H_matrix: (3, 3) float tensor — pixel-space homography from image1→image2
+        threshold: inlier pixel distance threshold
+    Returns:
+        abs_idx_matches: (K, 2) long tensor of matched (i, j) index pairs
+        ransac_inliers:  (K,) bool tensor — all True (every returned pair is an inlier)
+    """
+    if kpts1.shape[0] == 0 or kpts2.shape[0] == 0:
+        return torch.empty((0, 2), dtype=torch.long, device=kpts1.device), \
+               torch.empty(0, dtype=torch.bool, device=kpts1.device)
+
+    H = H_matrix.to(kpts1.device).float()
+    ones = torch.ones(kpts1.shape[0], 1, device=kpts1.device)
+    kpts1_h = torch.cat([kpts1.float(), ones], dim=1)          # (N, 3)
+    proj = (H @ kpts1_h.T).T                                   # (N, 3)
+    proj = proj[:, :2] / proj[:, 2:3].clamp(min=1e-6)          # (N, 2)
+
+    dists = torch.cdist(proj, kpts2.float())                    # (N, M)
+    min_dist, nn_idx = dists.min(dim=1)
+
+    inlier_mask = min_dist < threshold                          # (N,)
+    src_idx = torch.where(inlier_mask)[0]
+    dst_idx = nn_idx[inlier_mask]
+
+    abs_idx_matches = torch.stack([src_idx, dst_idx], dim=1)
+    ransac_inliers  = torch.ones(abs_idx_matches.shape[0], dtype=torch.bool,
+                                 device=kpts1.device)
+    return abs_idx_matches, ransac_inliers
+
 log = get_pylogger(__name__)
 
 torch.set_float32_matmul_precision('high')
@@ -53,21 +96,32 @@ np.random.seed(SEED)
 random.seed(SEED)
 
 
-def unpack_batch(batch):
-    # This function expects your custom dataset to return these keys
-    # Adjust key names if your imw2022.py returns different ones
-    src_image = batch["image0"]     # ← changed to match common naming
-    trg_image = batch["image1"]
-    # If your dataset does NOT return masks / homography / label, set them to None or remove
-    trg_mask = batch.get("trg_mask")
-    src_mask = batch.get("src_mask")
-    if trg_mask is None:
-        trg_mask = torch.ones((trg_image.shape[0], 1, trg_image.shape[2], trg_image.shape[3]), device=trg_image.device)
-    if src_mask is None:
-        src_mask = torch.ones((src_image.shape[0], 1, src_image.shape[2], src_image.shape[3]), device=src_image.device)
-    label = batch.get("label", None)
-    H = batch.get("homography", None)
+def collate_fn(batch):
+    """Custom collate that handles per-sample homography=None (real pairs)."""
+    from torch.utils.data.dataloader import default_collate
+    keys = batch[0].keys()
+    out = {}
+    for k in keys:
+        vals = [s[k] for s in batch]
+        if k == "homography":
+            # Keep as list — may contain None (real) or Tensor (synthetic)
+            out[k] = vals
+        else:
+            out[k] = default_collate(vals)
+    return out
 
+
+def unpack_batch(batch):
+    src_image = batch["image0"]
+    trg_image = batch["image1"]
+    src_mask = batch.get("src_mask")
+    trg_mask = batch.get("trg_mask")
+    if trg_mask is None:
+        trg_mask = torch.ones((trg_image.shape[0], 1, trg_image.shape[2], trg_image.shape[3]))
+    if src_mask is None:
+        src_mask = torch.ones((src_image.shape[0], 1, src_image.shape[2], src_image.shape[3]))
+    label = batch.get("label", None)
+    H = batch.get("homography", None)   # list of (3,3) tensors or None per sample
     return src_image, trg_image, src_mask, trg_mask, H, label
 
 
@@ -75,14 +129,34 @@ def unpack_batch(batch):
 def train(cfg):
     """Main training function for the RIPE model - using only custom dataset."""
 
+    # ── Device setup — resolve GPU explicitly, don't rely on fabric.device ──────
+    _cuda_available = torch.cuda.is_available()
+    print(f"[DEVICE] Python: {sys.executable}", flush=True)
+    print(f"[DEVICE] PyTorch: {torch.__version__}", flush=True)
+    print(f"[DEVICE] CUDA available: {_cuda_available}", flush=True)
+    if not _cuda_available:
+        import os
+        print(f"[DEVICE] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}", flush=True)
+        raise RuntimeError(
+            "\n\n*** CUDA NOT AVAILABLE ***\n"
+            f"  Python used: {sys.executable}\n"
+            f"  PyTorch: {torch.__version__}\n"
+            "  You are running the wrong Python. Use:\n"
+            '  "C:\\Program Files\\Python310\\python.exe" -m ripe.train\n'
+        )
+    DEVICE = torch.device("cuda:0")
+    print(f"[DEVICE] GPU: {torch.cuda.get_device_name(0)}  VRAM: {torch.cuda.get_device_properties(0).total_memory // 1024**2} MB", flush=True)
+    print(f"[DEVICE] Training on: {DEVICE}", flush=True)
+
     strategy = "ddp" if cfg.num_gpus > 1 else "auto"
     fabric = Fabric(
-        accelerator="cpu",          # Fallback to CPU for this quick 5-step test
-        devices=1,
+        accelerator="auto",
+        devices=cfg.num_gpus,
         precision=cfg.precision,
         strategy=strategy,
     )
     fabric.launch()
+    print(f"[DEVICE] fabric.device={fabric.device}  (using explicit DEVICE={DEVICE})", flush=True)
 
     output_dir = Path(cfg.output_dir)
     experiment_name = output_dir.parent.parent.parent.name
@@ -117,8 +191,10 @@ def train(cfg):
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        persistent_workers=False,
+        persistent_workers=cfg.num_workers > 0,   # keep workers alive between batches
         num_workers=cfg.num_workers,
+        pin_memory=torch.cuda.is_available(),      # fast CPU→GPU pin only when GPU present
+        collate_fn=collate_fn,
     )
     log.info("DataLoader created, skipping fabric.setup_dataloaders for Windows compatibility")
     # dl = fabric.setup_dataloaders(dl)  # Skip on Windows to avoid hanging
@@ -144,7 +220,7 @@ def train(cfg):
         net=instantiate(cfg.backbones),
         upsampler=upsampler,
         descriptor_dim=cfg.descriptor_dim if descriptor_loss is not None else None,
-        device=fabric.device,
+        device=DEVICE,
     ).train()
 
     # log number of parameters
@@ -172,15 +248,17 @@ def train(cfg):
     beta_scheduler = instantiate(cfg.beta_scheduler)
     inl_th_scheduler = instantiate(cfg.inl_th)
 
-    # running reward normalization for PPO stability (Windowed RMS)
-    reward_norm_mean_hist = collections.deque(maxlen=500)
-    reward_norm_var_hist = collections.deque(maxlen=500)
+    # running reward normalization for PPO stability (EMA using reward_norm_momentum)
+    reward_norm_mean_ema = 0.0
+    reward_norm_var_ema  = 1.0
+    reward_norm_ema_init = False   # warm up EMA with first batch value
 
     # PPO rollout buffer
     rollout_buffer = []
 
-    # Open result file for logging
-    result_file = Path(__file__).resolve().parent.parent / "results_80k.txt"
+    # Open result file inside the dated output folder — never overwritten between runs
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_file = output_dir / "results.txt"
     result_fh = open(result_file, "w", buffering=1)  # Line buffered
 
     def write_result(msg):
@@ -192,9 +270,18 @@ def train(cfg):
     # ======  Training Loop  ======
     net.train()
 
+    import time as _time
+    _DEBUG = True   # set False after first successful run
+
+    def _dbg(msg):
+        if _DEBUG:
+            print(f"[DEBUG {_time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    _dbg("Entering training loop")
+
     with tqdm.tqdm(total=steps) as pbar:
         for i_step in range(steps):
-            # write_result(f"[Step {i_step+1}/{steps}] Started")
+            _dbg(f"---- Step {i_step+1} start ----")
 
             alpha = alpha_scheduler(i_step)
             beta = beta_scheduler(i_step)
@@ -222,24 +309,46 @@ def train(cfg):
             current_value_loss = None
             sum_inliers = 0
 
+            _dbg("Loading batch from DataLoader...")
             try:
                 batch = next(i_dl)
             except StopIteration:
                 i_dl = iter(dl)
                 batch = next(i_dl)
+            _dbg(f"Batch loaded — label={[float(l) for l in batch['label']]}")
 
             p1, p2, mask_padding_1, mask_padding_2, Hs, label = unpack_batch(batch)
+            _dbg(f"Batch unpacked — p1={tuple(p1.shape)} dtype={p1.dtype} device={p1.device}")
+
+            # Move all data explicitly to GPU (Fabric device is not reliable when setup_dataloaders is skipped)
+            p1 = p1.to(DEVICE)
+            p2 = p2.to(DEVICE)
+            mask_padding_1 = mask_padding_1.to(DEVICE)
+            mask_padding_2 = mask_padding_2.to(DEVICE)
+            _dbg(f"Data moved to {DEVICE} — p1.device={p1.device}")
 
             # forward pass - extract keypoints & descriptors (PPO: also returns value estimates)
-            (kpts1, logprobs1, selected_mask1, mask_padding_grid_1, logits_selected_1, values1, entropy1, choices1, accepted_choices1, out1) = net(
-                p1, mask_padding_1, training=True
-            )
-            (kpts2, logprobs2, selected_mask2, mask_padding_grid_2, logits_selected_2, values2, entropy2, choices2, accepted_choices2, out2) = net(
-                p2, mask_padding_2, training=True
-            )
+            try:
+                _dbg("Forward pass 1 (image1)...")
+                (kpts1, logprobs1, selected_mask1, mask_padding_grid_1, logits_selected_1, values1, entropy1, choices1, accepted_choices1, out1) = net(
+                    p1, mask_padding_1, training=True
+                )
+                _dbg(f"Forward 1 done — kpts1={tuple(kpts1.shape)} device={kpts1.device}")
 
-            desc_1 = net.get_descs(out1["coarse_descs"], p1, kpts1, p1.shape[2], p1.shape[3])
-            desc_2 = net.get_descs(out2["coarse_descs"], p2, kpts2, p2.shape[2], p2.shape[3])
+                _dbg("Forward pass 2 (image2)...")
+                (kpts2, logprobs2, selected_mask2, mask_padding_grid_2, logits_selected_2, values2, entropy2, choices2, accepted_choices2, out2) = net(
+                    p2, mask_padding_2, training=True
+                )
+                _dbg(f"Forward 2 done — kpts2={tuple(kpts2.shape)}")
+
+                _dbg("Computing descriptors...")
+                desc_1 = net.get_descs(out1["coarse_descs"], p1, kpts1, p1.shape[2], p1.shape[3])
+                desc_2 = net.get_descs(out2["coarse_descs"], p2, kpts2, p2.shape[2], p2.shape[3])
+                _dbg(f"Descriptors done — desc_1={tuple(desc_1.shape)}")
+            except Exception as _fwd_err:
+                print(f"\n[FORWARD PASS ERROR] {type(_fwd_err).__name__}: {_fwd_err}", flush=True)
+                import traceback; traceback.print_exc()
+                raise
 
             if cfg.padding_filter_mode == "ignore":
                 # Ensure they are bool for the & operator
@@ -251,23 +360,88 @@ def train(cfg):
             else:
                 raise ValueError(f"Unknown padding filter mode: {cfg.padding_filter_mode}")
 
-            # matching
-            (
-                batch_rel_idx_matches,
-                batch_abs_idx_matches,
-                batch_ransac_inliers,
-                batch_Fm,
-            ) = matcher(
-                kpts1,
-                kpts2,
-                desc_1,
-                desc_2,
-                batch_mask_selection_for_matching_1,
-                batch_mask_selection_for_matching_2,
-                inl_th,
-                label if cfg.no_filtering_negatives else None,
-            )
+            # ── Matching ───────────────────────────────────────────────────────
+            _dbg("Starting matching...")
+            Hs_list = Hs if Hs is not None else [None] * batch_size
 
+            use_synthetic = [
+                (Hs_list[b] is not None and not (isinstance(Hs_list[b], torch.Tensor) and Hs_list[b].numel() == 0))
+                for b in range(batch_size)
+            ]
+            _dbg(f"use_synthetic={use_synthetic}")
+
+            if any(use_synthetic):
+                # Mixed batch: some synthetic, some real — handle per-sample
+                batch_rel_idx_matches = [torch.empty((0, 2), dtype=torch.long, device=DEVICE)] * batch_size
+                batch_abs_idx_matches = [torch.empty((0, 2), dtype=torch.long, device=DEVICE)] * batch_size
+                batch_ransac_inliers  = [torch.empty(0, dtype=torch.bool, device=DEVICE)] * batch_size
+                batch_Fm              = [None] * batch_size
+
+                real_indices = [b for b in range(batch_size) if not use_synthetic[b]]
+
+                # Process real samples through MNN+LO-RANSAC
+                if real_indices:
+                    r_kpts1   = torch.stack([kpts1[b] for b in real_indices])
+                    r_kpts2   = torch.stack([kpts2[b] for b in real_indices])
+                    r_desc1   = torch.stack([desc_1[b] for b in real_indices])
+                    r_desc2   = torch.stack([desc_2[b] for b in real_indices])
+                    r_m1      = torch.stack([batch_mask_selection_for_matching_1[b] for b in real_indices])
+                    r_m2      = torch.stack([batch_mask_selection_for_matching_2[b] for b in real_indices])
+                    r_lbl     = [label[b] for b in real_indices] if label is not None else None
+                    r_scores1 = torch.stack([logits_selected_1[b] for b in real_indices])
+                    r_scores2 = torch.stack([logits_selected_2[b] for b in real_indices])
+                    r_rel, r_abs, r_inl, r_fm = matcher(
+                        r_kpts1, r_kpts2, r_desc1, r_desc2, r_m1, r_m2, inl_th, r_lbl,
+                        scores1=r_scores1, scores2=r_scores2,
+                    )
+                    for i, b in enumerate(real_indices):
+                        batch_rel_idx_matches[b] = r_rel[i]
+                        batch_abs_idx_matches[b]  = r_abs[i]
+                        batch_ransac_inliers[b]   = r_inl[i]
+                        batch_Fm[b]               = r_fm[i]
+
+                # Process synthetic samples via H-based inlier computation
+                for b in range(batch_size):
+                    if not use_synthetic[b]:
+                        continue
+                    sel1 = batch_mask_selection_for_matching_1[b]
+                    sel2 = batch_mask_selection_for_matching_2[b]
+                    kpts1_sel = kpts1[b][sel1.bool()]
+                    kpts2_sel = kpts2[b][sel2.bool()]
+                    abs_m, inl = _synthetic_inliers(kpts1_sel, kpts2_sel, Hs_list[b])
+                    # remap from selected-space back to full keypoint indices
+                    full_idx1 = torch.where(sel1.bool())[0]
+                    full_idx2 = torch.where(sel2.bool())[0]
+                    if abs_m.shape[0] > 0:
+                        abs_m_full = torch.stack([full_idx1[abs_m[:, 0]], full_idx2[abs_m[:, 1]]], dim=1)
+                    else:
+                        abs_m_full = abs_m
+                    batch_abs_idx_matches[b]  = abs_m_full
+                    batch_ransac_inliers[b]   = inl
+                    # rel_idx not needed for synthetic (no desc loss indexing via rel_idx)
+                    batch_rel_idx_matches[b]  = abs_m_full   # reuse abs idx as rel idx
+            else:
+                _dbg("Calling MNN+RANSAC matcher (all-real batch)...")
+                (
+                    batch_rel_idx_matches,
+                    batch_abs_idx_matches,
+                    batch_ransac_inliers,
+                    batch_Fm,
+                ) = matcher(
+                    kpts1,
+                    kpts2,
+                    desc_1,
+                    desc_2,
+                    batch_mask_selection_for_matching_1,
+                    batch_mask_selection_for_matching_2,
+                    inl_th,
+                    label if cfg.no_filtering_negatives else None,
+                    scores1=logits_selected_1,
+                    scores2=logits_selected_2,
+                )
+                _dbg("Matcher done")
+
+            _dbg("Matching complete — computing rewards...")
             sample_mask_selection_for_matching_1 = []
             sample_mask_selection_for_matching_2 = []
             sample_mask_padding_grid_1 = []
@@ -352,24 +526,26 @@ def train(cfg):
                     filter_mode=cfg.padding_filter_mode,
                 ) * effective_reward_scale
 
-                batch_mean = dense_rewards.mean()
-                batch_var = dense_rewards.var(unbiased=False)
-                
-                # Windowed RMS normalizer (last 500 steps)
-                reward_norm_mean_hist.append(batch_mean.item())
-                reward_norm_var_hist.append(batch_var.item())
-                
-                reward_norm_mean_val = sum(reward_norm_mean_hist) / len(reward_norm_mean_hist)
-                reward_norm_var_val = sum(reward_norm_var_hist) / len(reward_norm_var_hist)
-                
-                reward_norm_std = math.sqrt(reward_norm_var_val + cfg.reward_norm_eps)
-                dense_rewards = (dense_rewards - reward_norm_mean_val) / reward_norm_std
+                batch_mean = dense_rewards.mean().item()
+                batch_var  = dense_rewards.var(unbiased=False).item()
+
+                # EMA normalizer — uses reward_norm_momentum from config (was unused before)
+                m = cfg.reward_norm_momentum
+                if not reward_norm_ema_init:
+                    reward_norm_mean_ema = batch_mean
+                    reward_norm_var_ema  = max(batch_var, cfg.reward_norm_eps)
+                    reward_norm_ema_init = True
+                else:
+                    reward_norm_mean_ema = m * reward_norm_mean_ema + (1 - m) * batch_mean
+                    reward_norm_var_ema  = m * reward_norm_var_ema  + (1 - m) * batch_var
+
+                reward_norm_std = math.sqrt(reward_norm_var_ema + cfg.reward_norm_eps)
+                dense_rewards = (dense_rewards - reward_norm_mean_ema) / reward_norm_std
 
                 if descriptor_loss is not None:
-                    # Smooth linear annealing 2.0 → 1.0 over desc_margin_anneal_steps.
-                    # The old instant jump at step 500 caused the observed loss spike in results_80k.
                     _anneal_steps = getattr(cfg, 'desc_margin_anneal_steps', 1000)
-                    descriptor_loss.pos_margin = 2.0 - 1.0 * min(1.0, i_step / max(_anneal_steps, 1))
+                    if hasattr(descriptor_loss, 'pos_margin'):
+                        descriptor_loss.pos_margin = 2.0 - 1.0 * min(1.0, i_step / max(_anneal_steps, 1))
                     hard_loss = descriptor_loss(
                         desc1=desc_1[b],
                         desc2=desc_2[b],
@@ -443,7 +619,7 @@ def train(cfg):
             # ====== Keypoint Count Floor Regularizer (Fix 2) ======
             # Penalize the policy when detected keypoints fall below a minimum
             # threshold — directly counteracts the suppression bias.
-            loss_kp_count = torch.tensor(0.0, device=p1.device)
+            loss_kp_count = torch.tensor(0.0, device=DEVICE)
             kp_count_floor = getattr(cfg, 'kp_count_floor', 380)
             kp_count_penalty = getattr(cfg, 'kp_count_penalty', 0.5)
             kp_count_warmup = getattr(cfg, 'kp_count_warmup_steps', 500)
@@ -465,7 +641,7 @@ def train(cfg):
 
             if is_warmup:
                 # Warmup: train descriptor head only, skip PPO entirely
-                warmup_loss = torch.tensor(0.0, device=p1.device)
+                warmup_loss = torch.tensor(0.0, device=DEVICE)
                 if loss_desc_stack is not None:
                     warmup_loss = warmup_loss + cfg.desc_loss_weight * loss_desc_stack.mean()
                 # Also apply kp count regularizer during warmup
@@ -476,25 +652,26 @@ def train(cfg):
                     fabric.clip_gradients(net, optimizer=opt_pi, max_norm=cfg.gradient_clip_norm)
                     opt_pi.step()
                     opt_pi.zero_grad()
-                loss = warmup_loss.detach() if isinstance(warmup_loss, torch.Tensor) else torch.tensor(0.0, device=p1.device)
+                loss = warmup_loss.detach() if isinstance(warmup_loss, torch.Tensor) else torch.tensor(0.0, device=DEVICE)
                 # Skip rollout buffer and PPO update
             else:
                 # ====== Normal Training: Aux losses + PPO ======
-                # Apply auxiliary losses and step optimizer BEFORE PPO
-                aux_loss = torch.tensor(0.0, device=p1.device)
+                _dbg("Computing aux loss (desc + kp)...")
+                aux_loss = torch.tensor(0.0, device=DEVICE)
                 if loss_desc_stack is not None:
                     aux_loss = aux_loss + cfg.desc_loss_weight * loss_desc_stack.mean()
                 if loss_kp_stack is not None:
                     aux_loss = aux_loss + loss_kp_stack.mean()
-                # Add keypoint count floor penalty
                 if loss_kp_count.item() > 0:
                     aux_loss = aux_loss + loss_kp_count
-                
+
                 if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
+                    _dbg(f"Backward aux_loss={aux_loss.item():.4f}...")
                     fabric.backward(aux_loss)
                     fabric.clip_gradients(net, optimizer=opt_pi, max_norm=cfg.gradient_clip_norm)
                     opt_pi.step()
                     opt_pi.zero_grad()
+                _dbg("Aux loss step done")
 
                 if loss_return_stack is not None:
                     loss_advantage_stack = loss_return_stack - loss_value_stack.detach()
@@ -525,8 +702,10 @@ def train(cfg):
                         'sample_mask_padding_grid_2': sample_mask_padding_grid_2,
                     })
 
+                _dbg(f"Rollout buffer size={len(rollout_buffer)}/{cfg.rollout_steps}")
                 # If rollout buffer is full, compute returns and advantages, then update
                 if len(rollout_buffer) >= cfg.rollout_steps:
+                    _dbg("PPO update starting...")
                     # Compute discounted returns and GAE (backwards)
                     for i in reversed(range(len(rollout_buffer))):
                         rewards = rollout_buffer[i]['rewards']
@@ -565,8 +744,8 @@ def train(cfg):
                         entropy_terms = []
 
                         for exp in rollout_buffer:
-                            p1_dev = exp['p1'].to(fabric.device)
-                            p2_dev = exp['p2'].to(fabric.device)
+                            p1_dev = exp['p1'].to(DEVICE)
+                            p2_dev = exp['p2'].to(DEVICE)
                             
                             logprobs1_new, values1_new, entropy1_new, _ = net.evaluate_actions(
                                 p1_dev, exp['choices1'], exp['accepted_choices1'], exp['mask_padding_1']
@@ -623,7 +802,8 @@ def train(cfg):
                         entropy_bonus = torch.stack(entropy_terms).mean()
 
                         ratio = torch.exp(new_logprobs_all - old_logprobs_all)
-                        current_clip_eps = 0.05 if i_step >= 5000 else cfg.ppo_clip_eps
+                        # Tighten clip after first 10% of training (8k/80k) for stability
+                        current_clip_eps = 0.05 if i_step >= (cfg.num_steps // 10) else cfg.ppo_clip_eps
                         clipped_ratio = torch.clamp(ratio, 1.0 - current_clip_eps, 1.0 + current_clip_eps)
                         policy_loss = -torch.min(ratio * old_advantages_all, clipped_ratio * old_advantages_all).mean()
                         value_loss = F.mse_loss(new_values_all, old_returns_all)
@@ -645,13 +825,13 @@ def train(cfg):
 
                         last_loss = epoch_loss.detach()
 
-                    loss = last_loss if last_loss is not None else torch.tensor(0.0, device=p1.device)
+                    loss = last_loss if last_loss is not None else torch.tensor(0.0, device=DEVICE)
                     # Clear rollout buffer
                     rollout_buffer = []
                     gc.collect()
 
                 else:
-                    loss = torch.tensor(0.0, device=p1.device)  # No update yet
+                    loss = torch.tensor(0.0, device=DEVICE)  # No update yet
 
             # ====== Periodic Checkpoint Saving (Fix 5) ======
             checkpoint_interval = getattr(cfg, 'checkpoint_interval', 5000)
@@ -662,6 +842,7 @@ def train(cfg):
                 torch.save(clean_state, ckpt_path)
                 write_result(f"[Checkpoint] Saved to {ckpt_path}")
 
+            _dbg(f"---- Step {i_step+1} COMPLETE ----")
             # logging
             reward_value = sum_raw_reward_batch / batch_size
             det_1 = int((sum_num_keypoints_1.item() if hasattr(sum_num_keypoints_1, "item") else sum_num_keypoints_1) / batch_size)
@@ -672,6 +853,13 @@ def train(cfg):
             phase = "WARMUP" if is_warmup else "PPO"
             
             write_result(f"[Step {i_step+1}/{steps}] [{phase}] PPO Loss: {loss.item():.4f}, Desc Loss: {desc_l:.4f}, KP Floor: {kp_count_l:.4f}, Reward: {reward_value:.4f}, Inliers: {inliers_avg:.1f}, Det: ({det_1}, {det_2})")
+            pbar.update(1)
+            pbar.set_postfix({
+                "R": f"{reward_value:.3f}",
+                "inl": f"{inliers_avg:.0f}",
+                "ppo": f"{loss.item():.3f}",
+                "desc": f"{desc_l:.3f}",
+            })
 
             if i_step % cfg.log_interval == 0:
                 det1_log = int(sum_num_keypoints_1.item() / batch_size) if hasattr(sum_num_keypoints_1, "item") else int(sum_num_keypoints_1 / batch_size)
